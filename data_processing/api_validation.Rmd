@@ -1,0 +1,98 @@
+---
+title: "SolarAPI Validation"
+author: "Henry Strecker"
+date: "2024-09-12"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(here)
+options(scipen = 999)
+
+```
+
+
+```{r, warning = FALSE, message = FALSE}
+# Read data and format columns as numeric
+solar_validation <- read_xlsx(here('code/data/solar_api_validation_data.xlsx')) %>%
+  mutate(across(c(object_id, roof_area:monthly_energy_bill), as.numeric)) %>%
+  filter(!str_detect(site_address, 'HI'))
+
+# Separate based on data source
+screening <- solar_validation %>% filter(data_source == 'screening')
+solar_api <- solar_validation %>% filter(data_source == 'solar_api')
+
+```
+
+
+Assess difference in solar generation values standardized on nameplate capacity
+
+```{r}
+generation_difference <- solar_validation %>% 
+  group_by(site_address) %>%
+  mutate(nameplate_scale = nameplate_capacity[1] / nameplate_capacity,
+         scaled_annual_solar_generation = annual_solar_generation * nameplate_scale) %>%
+  summarize(solar_generation_difference = scaled_annual_solar_generation[1] / scaled_annual_solar_generation[2])
+
+cat('Below is a summary for how google_api annual solar generation needs to be scaled to match the screenings\n\n')
+summary(generation_difference$solar_generation_difference)
+
+# Solar generation needs to be scaled down using the factor 0.885
+
+```
+
+Assess difference in assumed utility rate
+```{r}
+
+utility_rate <- solar_validation %>% 
+  group_by(site_address) %>%
+  summarize(utility_rate_diff = utility_rate[1] / utility_rate[2])
+
+cat('Below is a summary for how google_api utlity rate needs to be scaled to match the screenings\n\n')
+summary(utility_rate$utility_rate_diff)
+
+sqrt(var(utility_rate$utility_rate_diff))
+
+# We should not use utility rate coming from these results
+
+```
+
+
+Assess difference in max_panels and what is suggested in the screenings
+```{r}
+
+panel_adjustment <- solar_validation %>% 
+  filter(data_source == 'solar_api') %>%
+  mutate(panel_reduction = panel_count / max_panel_count) %>%
+  select(site_address, roof_area, max_panel_count, panel_count, panel_reduction)
+
+cat('Below is a summary for how google_api max panel count needs to be scaled to match the screenings\n\n')
+summary(panel_adjustment$panel_reduction)
+
+# More work needs to be done to understand the relationship here
+
+```
+
+Split the above into two categories based on roof size
+
+```{r}
+panel_adjustment_small <- panel_adjustment %>% 
+  filter(roof_area < 6000)
+
+summary(panel_adjustment_small$panel_reduction)
+
+panel_adjustment_large <- panel_adjustment %>%
+  filter(roof_area >= 6000)
+
+summary(panel_adjustment_large$panel_reduction)
+
+# This looks more promising
+
+```
+
+
+

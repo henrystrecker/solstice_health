@@ -1,0 +1,221 @@
+---
+title: "Geocode_API"
+author: "Henry Strecker"
+date: "2024-11-04"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(httr)
+library(jsonlite)
+library(tidyverse)
+```
+
+
+```{r}
+# Read in FQHC data to get coordinates
+fqhc <- read.csv('data/fqhc_site_august_14_2024.csv') %>% select(Site_Name, Site_Address, Site_City, Site_State_Abbreviation, ObjectId, x, y)
+
+```
+
+
+Need to deal with instances of hashtags, there's about 100 of them and mostly occur as suite/room numbers. Most can just exclude everything following the hashtag, need to look at others
+
+List of character exceptions #, &, /, ', @ and comma
+Remove all entries with & because they're normally crossroads, only 16 in total
+leave / if possible
+simply remove 'apostrophe', @
+Remove everything after comma, #
+
+```{r}
+
+# Test for formatting addresses correctly for the API call
+fqhc_subset <- fqhc %>%
+  mutate(clean_address = gsub("'|@|,*|#*", "", Site_Address),
+         geocode_input = gsub(' ', '+', paste0(clean_address, ',+', Site_City, ',+', Site_State_Abbreviation))) %>%
+  filter(!str_detect(clean_address, "&"),
+         ObjectId %in% c(18,26,3147,2140,1013,220,7809,2082,344,758,4974,4941,4973,
+                         5667,8613,231,7691,7406,2788,2786, 6844, 3779, 3411, 5)) # Sites from our test study, or that have special characters in their address
+
+test_string <- fqhc_subset$geocode_input[9]
+
+key <- 'REDACTED'
+
+# geocode_api_test <- GET(paste0('https://maps.googleapis.com/maps/api/geocode/json?address=', test_string, '&key=', key))
+# 
+# # Convert JSON to tabular format
+# test_data <- fromJSON(rawToChar(geocode_api_test$content))
+
+```
+
+
+More testing
+
+```{r}
+
+# # Create column with placeholder values
+# fqhc_subset$geocode_lat <- 0
+# fqhc_subset$geocode_lon <- 0
+# 
+# 
+# for (i in 1:dim(fqhc_subset)[1]){
+#   # Make API call for this row
+#   geocode_api_test <- GET(paste0('https://maps.googleapis.com/maps/api/geocode/json?address=', fqhc_subset$geocode_input[i], '&key=', key))
+# 
+#   # Convert JSON to tabular format
+#   test_data <- fromJSON(rawToChar(geocode_api_test$content))
+#   
+#   # Add values from the call to replace the placeholder
+#   fqhc_subset$geocode_lat[i] <- test_data$results$geometry$location$lat
+#   fqhc_subset$geocode_lon[i] <- test_data$results$geometry$location$lng
+#   }
+
+```
+
+```{r}
+
+# Function to fetch geocode data
+fetch_geocode <- function(address, key) {
+    # Make API call
+    response <- GET(paste0('https://maps.googleapis.com/maps/api/geocode/json?address=', 
+                           address, '&key=', key))
+    # Parse JSON response
+    data <- fromJSON(rawToChar(response$content))
+    if (!is.null(data$results) && length(data$results) > 0) { # Check if the data actually gets pulled 
+      if (is.null(data$results$geometry$location_type == "ROOFTOP")){ # Check that the rooftop coordinates exist
+        rooftop_coord_loc <- which(data$results$geometry$location_type == "ROOFTOP")
+        lat <- data$results$geometry$location$lat[rooftop_coord_loc] # Record the rooftop latitude
+        lng <- data$results$geometry$location$lng[rooftop_coord_loc] # Record the rooftop longitude
+        return(c(lat, lng))
+        } else { # Alternative if you can't get rooftop coords
+        lat <- data$results$geometry$location$lat[1] # Record alternate type latitude
+        lng <- data$results$geometry$location$lng[1] # Record alternate type longitude
+        return(c(lat, lng))
+        }
+      } else {
+      return(c(NA, NA))  # Handle instances that don't work out
+    }
+}
+
+# # Apply geocoding function to test group
+# fqhc_subset <- fqhc_subset %>%
+#   rowwise() %>%
+#   mutate(geocode_lat_lon = list(fetch_geocode(geocode_input, key))) %>% # Record results from API call
+#   mutate(geocode_lat = geocode_lat_lon[[1]], # Extract lat/lon value
+#          geocode_lon = geocode_lat_lon[[2]]) %>%
+#   ungroup() %>%
+#   select(-geocode_lat_lon) %>% # Remove listed version of coordinates
+#   mutate(lat_diff = geocode_lat - y,
+#          long_diff = geocode_lon - x) # Calculate a check
+
+```
+
+
+## Test results for a subset of sites
+
+Out of the 50 sites completed below, 48 had quality results. The two bad results came from poor addresses. This is good to see that this process works as intended, and the two sites with bad coordinates were significantly different than the original coordinates, so I can use that information and create reasonable acceptance criteria for new coordinates. Any new coordinates that differ by a margin higher than 0.005 will not be accepted by the code created two chunks below.
+
+```{r}
+
+# set.seed(50)
+# 
+# # Create a random sample of 50 sites and clean the addresses
+# random50_test <- fqhc[sample(nrow(fqhc), 50), ] %>%
+#   mutate(clean_address = gsub("'|@|,*|#*", "", Site_Address), # Remove all apostrophes, ats, commas, hashtags
+#          geocode_input = gsub(' ', '+', paste0(clean_address, ',+', Site_City, ',+', Site_State_Abbreviation))) %>%
+#   filter(!str_detect(clean_address, "&"))
+# 
+# # Create column with placeholder values
+# random50_test$geocode_lat <- 0
+# random50_test$geocode_lon <- 0
+# 
+# # Apply geocoding function
+# random50_test <- random50_test %>%
+#   rowwise() %>% # Process row-by-row
+#   mutate(geocode_lat_lon = list(fetch_geocode(geocode_input, key))) %>% # Make API call and record coordinates
+#   mutate(geocode_lat = geocode_lat_lon[[1]],
+#          geocode_lon = geocode_lat_lon[[2]]) %>% # Update coordinate values in data
+#   ungroup() %>%
+#   select(-geocode_lat_lon) %>% # Remove column with double coords
+#   mutate(lat_diff = geocode_lat - y,
+#          long_diff = geocode_lon - x) # Calculate difference between old/new coords
+
+```
+
+
+## Code to Update Entire FQHC dataset coordinates
+
+```{r}
+# Set new API key, comment it out so this can't run accidentally
+key1 <- 'REDACTED'
+
+# Setup, remove about 20 locations that can't produce results
+fqhc_new_coords <- fqhc %>%
+  mutate(clean_address = gsub("'|@|,*|#*", "", Site_Address), # Remove all apostrophes, ats, commas, hashtags
+         geocode_input = gsub(' ', '+', paste0(clean_address, ',+', Site_City, ',+', Site_State_Abbreviation))) %>% # Format strings
+  filter(!str_detect(clean_address, "&"),  # Remove all instances of the & symbol
+         !ObjectId == 2113) # Remove error-prone site (located in PR and Google doesn't like its address)
+
+# initialize new coordinate columns
+fqhc_new_coords$geocode_lat <- 0
+fqhc_new_coords$geocode_lon <- 0
+
+for (i in 0 : as.integer(dim(fqhc_new_coords)[1] / 400) + 1){ # Will help to split this process into smaller chunks
+  if (i == 30){
+    iteration_data <- fqhc_new_coords[((i-1)*400 + 1):dim(fqhc_new_coords)[1], ] # Special case for indexing at the end
+  } else {
+    iteration_data <- fqhc_new_coords[((i-1)*400 + 1):(i*400), ] # Standard index case, pulls 400 records at a time
+  }
+  # Make API Call
+  iteration_results <- iteration_data %>%
+    rowwise() %>% # Process row-by-row
+    mutate(geocode_lat_lon = list(fetch_geocode(geocode_input, key1))) %>% # Make API call and record coordinates
+    mutate(geocode_lat = geocode_lat_lon[[1]],
+           geocode_lon = geocode_lat_lon[[2]]) %>% # Update coordinate values in data
+    ungroup() %>%
+    select(-geocode_lat_lon) %>% # Remove column with repeated coords
+    mutate(lat_diff = geocode_lat - y, # Calculate difference between old/new coords
+           lon_diff = geocode_lon - x,
+           accept_coords = ((abs(lat_diff) <= 0.005) & (abs(lon_diff) <= 0.005))) # Create T/F for updating coords
+  
+  # Write results to a csv
+  write.csv(iteration_results, file.path('data/geocode_results', paste0('fqhc_geocode_', i, '.csv')), row.names = FALSE)
+}
+
+```
+
+
+Skip to here if the above chunk has already been run
+
+```{r}
+# Initialize an empty data frame
+geocode_results_all <- data.frame()
+
+# Populate with geocoding results
+for (i in list.files(file.path('data/geocode_results'))){
+  geocode_results_all <- rbind(geocode_results_all, read.csv(file.path('data/geocode_results', i)))
+}
+
+geocode_results_all <- geocode_results_all %>%
+  select(ObjectId, geocode_lat, geocode_lon, accept_coords) %>% # Only care about these columns
+  distinct() # Remove the one duplicate row
+
+fqhc_output <- read.csv('data/fqhc_site_august_14_2024.csv') %>% rename(site_lat = y, site_lon = x) # Rename coordinate columns
+
+# Join results with original data
+fqhc_output <- fqhc_output %>%
+  left_join(geocode_results_all, by = 'ObjectId') %>% # Join based on ObjectId
+  mutate(site_lat = case_when(accept_coords == TRUE ~ geocode_lat, # Accept new coords
+                              accept_coords == FALSE | is.na(accept_coords) ~ site_lat), # Reject new coords
+         site_lon = case_when(accept_coords == TRUE ~ geocode_lon,
+                              accept_coords == FALSE | is.na(accept_coords) ~ site_lon)) %>%
+  select(-geocode_lat, -geocode_lon, -accept_coords) # Remove unnecessary columns
+
+write_csv(fqhc_output, 'data/fqhc_sites_january_10_2025.csv') # Write final output
+
+
+```
+
+

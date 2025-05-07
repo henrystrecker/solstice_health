@@ -1,0 +1,261 @@
+---
+title: "Site Population Matching"
+date: "August 2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(stringi)
+library(tidycensus)
+library(sf)
+library(tigris)
+library(dplyr)
+
+```
+
+The code below sets up the rest of the document to run smoothly. If you are trying to run this code, you will need to change the file paths and file names to reflect the newer versions of the data you're trying to use.
+
+```{r}
+
+# Get your own API key here: https://api.census.gov/data/key_signup.html
+census_api_key('YOUR_KEY_HERE', install = TRUE, overwrite = TRUE)
+
+# UPDATE this with the location of your data
+data_path <- 'data/raw'
+
+# UPDATE this with where you want the output, and change the date
+output_location <- 'data/fqhc_site_august_14_2024.csv'
+
+# UPDATE this with whatever the filename is for the fqhc data
+fqhc_data_name <- 'fqhc_sites_july_30_2024.csv' 
+
+# Downloaded from Collective's internal ESRI dashboard
+fqhc <- read.csv(file.path(data_path, fqhc_data_name)) 
+
+# Downloaded from Census under 'Datasets' tab https://www.census.gov/data/tables/time-series/demo/popest/2020s-total-cities-and-towns.html
+city_pop <- read.csv(file.path(data_path, 'sub-est2023.csv'))
+
+# Downloaded from Census https://data.census.gov/table?q=Annual%20Estimates%20of%20the%20Resident%20Population&g=010XX00US$1600000
+places_pop <- read.csv(file.path(data_path, 'DECENNIALDP2020.DP1-Data.csv'))
+
+# Downloaded from SimpleMaps https://simplemaps.com/data/us-neighborhoods
+neighborhood_link <- read.csv(file.path(data_path, 'usneighborhoods.csv'))
+
+```
+
+Utilize census data to fill population values, assess coverage of this method
+```{r, warning = FALSE}
+places_pop_clean <- places_pop %>%
+  select(GEO_ID, NAME, DP1_0001C) %>%
+  mutate(DP1_0001C = as.numeric(DP1_0001C)) %>% # Make population column numeric
+  filter(!str_detect(NAME, '(pt.)'), # Removes partial city data
+         !str_detect(NAME, 'township')) %>% # Removes townships that overlap with cities
+  separate(NAME, into = c("Site_City", "State_Name"), sep = ", ", extra = "merge", fill = "right") %>%
+  mutate(Site_City = stri_replace_all_regex(stri_trans_nfd(Site_City), "\\p{Mn}", ""), # Removes special characters from PR cities
+         Site_City = str_replace(Site_City, ' city.*', ''), # Remove unnecessary name endings
+         Site_City = str_replace(Site_City, ' town.*', ''),
+         Site_City = str_replace(Site_City, ' village.*', ''),
+         Site_City = str_replace(Site_City, ' borough.*', ''),
+         Site_City = str_replace(Site_City, ' County.*', ''),
+         Site_City = str_replace(Site_City, ' municipality.*', ''),
+         Site_City = str_replace(Site_City, 'St\\.', 'Saint'),
+         Site_City = str_replace(Site_City, ' CDP.*', ''),
+         Site_City = str_replace(Site_City, "'", ""), # Remove apostrophes
+         Site_City = str_replace(Site_City, ' zona urbana', ''),
+         Site_City = str_replace(Site_City, ' comunidad', ''),
+         Site_City = ifelse(State_Name %in% c('Georgia', 'Kentucky', 'North Carolina', 
+                                              'Montana', 'Tennessee'), 
+                            str_replace(Site_City, '-.*', ''), Site_City), # Remove extra long endings after hyphens
+         
+         Site_City = str_replace(Site_City, 'Coeur dAlene', 'coeur d alene'), # Specific instance in Idaho
+         Site_City = str_replace(Site_City, 'El Paso de.*', 'paso robles'), # Specific instance in California
+         Site_City = tolower(Site_City)) %>%
+  select(Site_City, State_Name, Population = DP1_0001C) %>% # Take specific columns and rename population
+  group_by(Site_City, State_Name) %>%
+  summarize(across(c(Population), max)) %>% # Simplify results if there are duplicates, taking the max population
+  ungroup()
+
+city_pop_clean <- city_pop %>%
+  filter(FUNCSTAT %in% c('A', 'B', 'C'), # Ensures we only get active cities
+         !str_detect(NAME, '(pt.)'), # Removes partial city data
+         !str_detect(NAME, 'township')) %>% # Removes townships that overlap with cities
+  select(Site_City = NAME, State_Name = STNAME, Population = ESTIMATESBASE2020) %>%
+  mutate(Site_City = stri_replace_all_regex(stri_trans_nfd(Site_City), "\\p{Mn}", ""), # Removes special characters from PR cities
+         Site_City = str_replace(Site_City, ' city.*', ''), # Remove unnecessary name endings
+         Site_City = str_replace(Site_City, ' town.*', ''),
+         Site_City = str_replace(Site_City, ' village.*', ''),
+         Site_City = str_replace(Site_City, ' borough.*', ''),
+         Site_City = str_replace(Site_City, ' County.*', ''),
+         Site_City = str_replace(Site_City, ' municipality.*', ''),
+         Site_City = str_replace(Site_City, 'St\\.', 'Saint'),
+         Site_City = str_replace(Site_City, "'", ""), # Remove apostrophes
+         Site_City = str_replace(Site_City, ' zona urbana', ''),
+         Site_City = str_replace(Site_City, ' comunidad', ''),
+         Site_City = ifelse(State_Name %in% c('Georgia', 'Kentucky', 'North Carolina', 
+                                              'Montana', 'Tennessee'), 
+                            str_replace(Site_City, '-.*', ''), Site_City),
+         Site_City = str_replace(Site_City, "Coeur dAlene", "coeur d alene"), # Specific instance in Idaho
+         Site_City = str_replace(Site_City, "El Paso de.*", "paso robles"), # Specific instance in California
+         Site_City = tolower(Site_City)) %>% # Join above observations
+  group_by(Site_City, State_Name) %>%
+  summarize(across(c(Population), max)) %>% # Simplify results if there are duplicates
+  ungroup()
+
+fqhc <- fqhc %>%
+  mutate(Site_City = tolower(Site_City), # Make names lowercase to match
+         Site_City = str_replace(Site_City, 'mc ', 'mc')) # Update so all places with 'mc' are updated to match
+
+fqhc_population_new <- left_join(fqhc, places_pop_clean, by = c('State_Name', 'Site_City')) %>% # Join data by state and city
+  select(Site_City, State_Name, Population, ObjectId, x, y) %>%
+  left_join(city_pop_clean, by = c('State_Name', 'Site_City')) %>% # Join secondary data set by state and city
+  mutate(Population.x = ifelse(!is.na(Population.y), Population.y, Population.x)) %>% # Update empty population entries with new values 
+  select(Site_City, State_Name, Population = Population.x, ObjectId, x, y) # Remove unnecessary columns
+
+fqhc_pop_missing <-  fqhc_population_new[is.na(fqhc_population_new[['Population']]), ] %>% # Filter for missing populations
+  mutate(location_full = paste(Site_City, ', ', State_Name, sep = '')) # Create new variable for easy manual searching
+
+length(unique(fqhc_pop_missing$location_full)) # Number of unique missing locations
+
+```
+
+The above chunk leaves 582 sites across 292 cities without population data
+Below uses a neighborhood data set to link some FQHC sites whose listed 'city' is actually a neighborhood. If possible, it will be replaced by the broader city they're located in.
+
+```{r}
+neighborhood_link_clean <- neighborhood_link %>%
+  select(Site_City = neighborhood, State_Name = state_name, Updated_City = city_name) %>% # Rename columns
+  mutate(Site_City = tolower(Site_City), # Make column entries lowercase so they'll match up with other data
+         Updated_City = tolower(Updated_City))
+
+updated_locations <- left_join(fqhc_pop_missing, neighborhood_link_clean, by = c('State_Name', 'Site_City')) # Connect some missing sites to cities
+
+fqhc_population_new <- fqhc_population_new %>%
+  left_join(updated_locations, by = c('ObjectId')) %>% # Use ObjectId to link updated locations
+  mutate(Site_City.x = ifelse(!is.na(Updated_City), Updated_City, Site_City.x)) %>% # Updated site city locations with new finds
+  select(Site_City = Site_City.x, State_Name = State_Name.x, ObjectId, x = x.x, y = y.x) %>% # Rename columns
+  left_join(places_pop_clean, by = c('State_Name', 'Site_City')) %>% # Join data by state and city
+  select(Site_City, State_Name, Population, ObjectId, x, y) %>%
+  left_join(city_pop_clean, by = c('State_Name', 'Site_City')) %>% # Join secondary data set by state and city
+  mutate(Population.x = ifelse(!is.na(Population.y), Population.y, Population.x)) %>% # Update empty population entries with new values 
+  select(Site_City, State_Name, Population = Population.x, ObjectId, x, y) # Remove unnecessary columns
+
+```
+
+
+Fill the remaining sites with the use of site coordinates. These are intersected with Census tract 
+```{r}
+# Create a subset of remaining missing sites
+missing_locs <- fqhc_population_new[is.na(fqhc_population_new$Population), ] 
+
+# Create spatial object with site coordinates
+coords_sf <- st_as_sf(missing_locs, coords = c("x", "y"), crs = 4326) 
+
+# Make a list of all 50 states, D.C., and Puerto Rico
+states <- unique(fips_codes$state)[1:55] 
+
+# Aggregate Census tract shapefiles
+tracts_list <- map(states, ~tracts(state = .x, year = 2020, class = "sf")) 
+
+# Combine all states' tracts into one sf object
+all_tracts <- do.call(rbind, tracts_list) %>% 
+  st_transform(all_tracts, crs = 4326) # Set matching coordinate system
+
+# Spatial join coordinates with tracts to get the GEOID
+coords_with_geoid <- st_join(coords_sf, all_tracts, join = st_intersects) %>% distinct() 
+
+# Get population data for each unique GEOID through the Census American Community Survey
+population_data <- map_dfr(unique(coords_with_geoid$GEOID), 
+                           ~get_acs(geography = "tract", 
+                                    variables = "B01003_001", 
+                                    year = 2020, 
+                                    state = substr(.x, 1, 2), 
+                                    tract = substr(.x, 3, 11)))
+
+# Join the population data back to original coordinates
+missing_locs_found <- coords_with_geoid %>%
+  st_drop_geometry() %>% # Not needed anymore
+  left_join(population_data, by = "GEOID") %>% # Link sites to population values
+  distinct() %>% # Remove duplicates if they occur
+  select(ObjectId, estimate)
+
+```
+
+Combine results into a final dataframe and write the final output
+```{r}
+# Add newly found values to ongoing data
+final_pop_results <- fqhc_population_new %>%
+  left_join(missing_locs_found, by = c('ObjectId')) %>%
+  mutate(Population = ifelse(!is.na(estimate), estimate, Population)) %>% # Update formerly missing populations
+  select(-estimate) %>% # Remove unnecessary column
+  mutate(rural_indicator = Population < 10000, # Create indicator column
+         community_rural_doe = case_when(rural_indicator == TRUE ~ 'Yes',
+                                         rural_indicator == FALSE ~ 'No')) %>%
+  select(ObjectId, site_city_population_2020 = Population, community_rural_doe) # Remove unwanted columns
+
+
+# Get the original, unaltered data
+fqhc <- read.csv('data/raw/fqhc_sites_july_30_2024.csv') 
+
+# Reorganize column names for final data output, including the new column
+fqhc_colnames <- append(colnames(fqhc), 'site_city_population_2020', after = which(colnames(fqhc) == 'community_rural_doe')) 
+
+# Create finalized data
+updated_fqhc <- fqhc %>%
+  select(-community_rural_doe) %>% # Remove old version of this column which will be updated
+  left_join(final_pop_results, by = 'ObjectId') %>% # Join new columns
+  select(all_of(fqhc_colnames)) # Organize columns for output
+
+# Write output
+write.csv(updated_fqhc, output_location, row.names = FALSE)
+```
+
+
+
+*********************************
+THE BELOW CODE IS NOT REQUIRED
+*********************************
+
+Attempt to use RUCA codes for rural identification
+This code has been abandoned for the approach above utilizing Census tract shapefiles to fulfill all missing values
+
+```{r}
+
+# Download from https://www.ers.usda.gov/data-products/rural-urban-commuting-area-codes/#:~:text=The%20rural-urban%20commuting%20area,%2C%20urbanization%2C%20and%20daily%20commuting.
+# The specific file was '2010 Rural-Urban Commuting Area Codes, ZIP code file'
+ruca <- read_xlsx(file.path(data_path, 'RUCA2010zipcode.xlsx'), sheet = 'Data') %>%
+  filter(ZIP_TYPE == 'Zip Code Area') %>%
+  select(Site_Postal_Code = ZIP_CODE, RUCA1)
+
+fqhc_population_ruca <- left_join(fqhc, all_census_locations, by = c('State_Name', 'Site_City')) %>% # Join data by state and city
+  select(Site_City, State_Name, Site_Postal_Code, Population) %>%
+  mutate(Site_Postal_Code = str_replace(Site_Postal_Code, '-.*', '')) %>%
+  left_join(ruca, by = 'Site_Postal_Code') %>%
+  mutate(rural_ruca = 
+           case_when(RUCA1 >= 7 ~ TRUE,
+                     RUCA1 <= 6 ~ FALSE),
+         rural_pop = 
+           case_when(Population <= 10000 ~ TRUE,
+                     Population > 10000 ~ FALSE))
+
+# About 50 of the sites that were not covered by the census data are also missing here, so this method is imperfect
+
+cross_reference <- fqhc_population_ruca$rural_ruca == fqhc_population_ruca$rural_pop
+
+length(cross_reference) - sum(is.na(cross_reference)) # Total number excluding NAs
+sum(na.omit(cross_reference)) # Amount that match up equally
+# So about 10,200 sites of 11,700 total match up between the census population and RUCA, excluding NAs 
+
+mismatch <- na.omit(fqhc_population_ruca[fqhc_population_ruca$rural_ruca != fqhc_population_ruca$rural_pop, ])
+# Almost every mismatch is Census rural but RUCA urban
+# After searching through some of the mismatch signs, it's unclear which set is more accurate
+# RUCA appears wrong in more rural areas but more accurate in urban ones
+
+# All sites that are missing classification from at least one of the two sources
+test <- fqhc_population_ruca[is.na(cross_reference), ]
+
+```
+
+

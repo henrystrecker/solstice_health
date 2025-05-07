@@ -1,0 +1,44 @@
+---
+title: "Solar Incentive Intersection"
+author: "Henry Strecker"
+date: "2025-02-23"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(readxl)
+library(sf)
+```
+
+```{r, message=FALSE}
+fqhc <- read.csv('data/data_layers_jan20.csv')
+
+# Read in the two shapefiles of interest to intersect with
+# Both of these files share the same CRS
+msa_areas <- st_read('data/Shapefiles/2024_msa.shp')
+coal_closures <- st_read('data/Shapefiles/coal_closure.shp')
+
+# Convert the FQHC site coordinates to a geometry/feature and adjust CRS to match with the shapefiles above
+site_coords <- st_as_sf(fqhc, coords = c('site_lon', 'site_lat'), crs = 4326) %>%
+  st_transform(crs = st_crs(msa_areas))
+
+# Create logical columns indicating whether the site intersects each layer
+site_coords$in_coal_closure <- lengths(st_intersects(site_coords, coal_closures)) > 0
+site_coords$in_msa_area <- lengths(st_intersects(site_coords, msa_areas)) > 0
+
+# Create column that combines the last two and tells us T/F whether the site qualifies for extra incentive
+site_coords$in_either <- site_coords$in_coal_closure | site_coords$in_msa_area
+
+# Format results before exporting
+tax_incentive_classification <- site_coords %>%
+  select(ObjectId, in_either) %>%
+  rename(qualifies = in_either) %>%
+  st_drop_geometry()
+
+write.csv(tax_incentive_classification, 'data/solar_tax_incentives.csv')
+
+```
+

@@ -1,0 +1,54 @@
+---
+title: "Processed Extreme Events Data"
+author: "Reeves Erickson"
+format: html
+editor: visual
+---
+
+## Start
+
+```{r}
+library(here)
+library(tidyverse)
+library(janitor)
+library(readxl)
+```
+
+Process
+
+```{r}
+nat_dis <- read.csv("data/raw/CVI_Extreme_Events.csv")
+
+```
+
+```{r}
+nat_dis_cleaned <- nat_dis %>% 
+  mutate(FIPS = as.integer(substr(as.character(FIPS), 1, nchar(as.character(FIPS)) - 6))) %>% 
+  group_by(FIPS) %>% 
+  summarize(
+    ToxPi_Score = mean(`ToxPi.Score`, na.rm = TRUE),
+    Temperature = mean(Temperature, na.rm = TRUE),
+    Droughts = mean(Droughts, na.rm = TRUE),
+    Wildfires = mean(Wildfires, na.rm = TRUE),
+    Precipitation = mean(Precipitation, na.rm = TRUE),
+    Flooding = mean(Flooding, na.rm = TRUE),
+    Storms = mean(Storms, na.rm = TRUE)
+  ) %>% 
+  mutate(
+    ToxPi_Score_Percentile = ntile(ToxPi_Score, 100),
+    Temperature_Percentile = ntile(Temperature, 100),
+    Droughts_Percentile = ntile(Droughts, 100),
+    Wildfires_Percentile = ntile(Wildfires, 100),
+    Precipitation_Percentile = ntile(Precipitation, 100),
+    Flooding_Percentile = ntile(Flooding, 100),
+    Storms_Percentile = ntile(Storms, 100)
+  )
+
+colnames(nat_dis)
+```
+
+```{r}
+#Save
+write_csv(nat_dis_cleaned, here("code/data/raw", "nat_disaster_data_processed.csv"))
+
+```

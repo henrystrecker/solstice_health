@@ -1,0 +1,391 @@
+---
+title: "SolarAPI Data Collection"
+author: "Henry Strecker"
+date: "2025-02-03"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(httr)
+library(jsonlite)
+library(tidyverse)
+library(readxl)
+```
+
+## Read in data sources
+
+```{r}
+# Read in data and panel model
+fqhc <- read.csv('data/data_layers_jan20.csv')
+
+panels_model <- readRDS('data/panel_count_model.rds')
+
+api_key <- 'REDACTED'
+
+```
+
+
+```{r}
+# Define a function similar to previous iterations that focuses on using the panel model to generate SolarAPI responses for each site
+fetch_solarapi <- function(latitude, longitude, site_id, key){
+  Sys.sleep(0.11) # Sleep for a fraction of a second so as to not to exceed the API request limit (600/min)
+  
+  # Call the API to get results for a given site
+  solar_api_test <- GET(paste0('https://solar.googleapis.com/v1/buildingInsights:findClosest?location.latitude=', latitude, 
+                               '&location.longitude=', longitude, '&requiredQuality=HIGH&key=', key))
+  
+  # Convert JSON to tabular format
+  test_data <- fromJSON(rawToChar(solar_api_test$content))
+  
+  # Check if the requiredQuality=HIGH parameter was met, if not run requiredQuality=MEDIUM
+  if (!is.null(test_data$error$message) && test_data$error$message == 'Requested entity was not found.'){
+    solar_api_test <- GET(paste0('https://solar.googleapis.com/v1/buildingInsights:findClosest?location.latitude=', latitude, 
+                                 '&location.longitude=', longitude, '&requiredQuality=MEDIUM&key=', key))
+  
+    # Convert JSON to tabular format
+    test_data <- fromJSON(rawToChar(solar_api_test$content))
+  }
+  
+  # Check if the requiredQuality=MEDIUM parameter was met, if not run requiredQuality=LOW
+  if (!is.null(test_data$error$message) && test_data$error$message == 'Requested entity was not found.'){
+    solar_api_test <- GET(paste0('https://solar.googleapis.com/v1/buildingInsights:findClosest?location.latitude=', latitude, 
+                                 '&location.longitude=', longitude, '&requiredQuality=LOW&key=', key))
+  
+    # Convert JSON to tabular format
+    test_data <- fromJSON(rawToChar(solar_api_test$content))
+  }
+  
+  # Deal with edge case where API doesn't pass due to an API restriction
+  while (!is.null(test_data$error$message) && grepl('IP address restriction', test_data$error$message)){
+    solar_api_test <- GET(paste0('https://solar.googleapis.com/v1/buildingInsights:findClosest?location.latitude=', latitude, 
+                                 '&location.longitude=', longitude, '&requiredQuality=LOW&key=', key))
+  
+    # Convert JSON to tabular format
+    test_data <- fromJSON(rawToChar(solar_api_test$content))
+  }
+  
+  # Write SolarAPI output to save all information
+  write_rds(test_data, paste0('data/solarapi_responses/', 'site_', site_id, '_solarapi.rds'))
+  
+  # Handle case where there are insufficient/missing SolarAPI results - no data returned here
+  if (is.null(test_data$solarPotential) & length(test_data$solarPotential$maxArrayPanelsCount) == 0){
+    return(rep(NA, 8)) # In case SolarAPI doesn't produce results for a site
+  } else if (is.null(test_data$solarPotential$maxArrayPanelsCount) || test_data$solarPotential$maxArrayPanelsCount < 10){
+    return(rep(NA, 8)) # In case SolarAPI can't place a minimum of 10 panels on a roof
+  }
+  
+  # Maximum number of panels from api call
+  max_panels <- as.numeric(test_data$solarPotential$maxArrayPanelsCount)
+  
+  # Total roof area in square feet from api call converted from square meters
+  roof_area_sqft <- test_data$solarPotential$wholeRoofStats$areaMeters2 * 10.7639
+  roof_area_sqm <- test_data$solarPotential$wholeRoofStats$areaMeters2
+  
+  # Store the master set of panel configurations and solar output for this site
+  panels_generation <- test_data$solarPotential$solarPanelConfigs
+  
+  # Define roof size indicator variables for the panel modeling prediction
+  if (roof_area_sqft <= 7000){
+    small_area <- 1
+    medium_area <- 0
+  } else if (roof_area_sqft <= 15000){
+    small_area <- 0
+    medium_area <- 1
+  } else {
+    small_area <- 0
+    medium_area <- 0
+  }
+  
+  # Estimate true number of panels based on max_panels and roof area using the linear regression model
+  panel_prediction <- unname(predict(panels_model, list(max_panel_count = max_panels, small_site = small_area, medium_site = medium_area)))
+  
+  # Extracts the configuration that matches the number of panels modeled above
+  annual_solar_generation <- panels_generation[panels_generation$panelsCount == panel_prediction, ]
+  panel_count <- panel_prediction
+
+  # If the number of modeled panels doesn't exactly match with the API call, this will find the next closest match
+  if (dim(annual_solar_generation)[1] == 0){
+    panel_count <- panels_generation$panelsCount[which.min(abs(panels_generation$panelsCount - panel_prediction))]
+    annual_solar_generation <- panels_generation[panels_generation$panelsCount == panel_count, ]
+  }
+  
+  nameplate_capacity <- panel_count * 400 / 1000 # 400W panels, scaled to kW from W
+  
+  # Generate true solar production potential, based on 400W panels and solar generation similar to Aurora screenings (scale at 88.5%)
+  adjusted_solar_annual_kwh <- annual_solar_generation$yearlyEnergyDcKwh * (0.885)
+  
+  # Relevant number of roof segments - meant for solving issue with residential buildings that have roof segments that can't house panels
+  roof_segment_count <- as.numeric(length(pull(tail(test_data$solarPotential$solarPanelConfigs$roofSegmentSummaries, 1)[[1]]['panelsCount'])))
+  
+  # Calculate roof height ine meters above sea level, taking the average across all roof segments
+  building_height_sealevel <- mean(test_data$solarPotential$roofSegmentStats$planeHeightAtCenterMeters)
+  
+  # Extract median irradiance for each roof segment
+  median_irradiance <- c()
+  for (i in 1 : roof_segment_count){
+    n_breaks <- length(test_data$solarPotential$roofSegmentStats$stats$sunshineQuantiles[[i]]) # Number of breaks for percentile calculations
+    median_irradiance <- c(median_irradiance, test_data$solarPotential$roofSegmentStats$stats$sunshineQuantiles[[i]][n_breaks %/% 2 + 1]) # Ensures median is extracted
+  }
+  
+  # Create roof area data for how much of the roof faces each direction
+  roof_stats <- test_data$solarPotential$roofSegmentStats
+  roof_stats_df <- data.frame(pitch = head(roof_stats$pitchDegrees, roof_segment_count),
+                              azimuth = head(roof_stats$azimuthDegrees, roof_segment_count),
+                              roof_area_sqm = head(roof_stats$stats$areaMeters2, roof_segment_count),
+                              roof_segment_panel_count = pull(tail(test_data$solarPotential$solarPanelConfigs$roofSegmentSummaries, 1)[[1]]['panelsCount']),
+                              roof_segment_irradiance = median_irradiance)
+  
+  solar_panel_size_sqm <- test_data$solarPotential$panelHeightMeters * test_data$solarPotential$panelWidthMeters
+  num_roof_segments <- as.numeric(dim(roof_stats_df)[1])
+  
+  # Initialize variables
+  usable_roof_area_sqm <- 0
+  irradiance_times_area <- 0
+  
+  # Calculate total roof summary statistics
+  for (i in 1:dim(roof_stats_df)[1]){
+    if (roof_stats_df$pitch[i] <= 10){ # Included because flat roofs are given azimuth of 0
+      usable_roof_area_sqm <- usable_roof_area_sqm + roof_stats_df$roof_segment_panel_count[i] * solar_panel_size_sqm
+      irradiance_times_area <- irradiance_times_area + (roof_stats_df$roof_segment_panel_count[i] * solar_panel_size_sqm * roof_stats_df$roof_segment_irradiance[i])
+    } else if (roof_stats_df$pitch[i] <= 45 & roof_stats_df$azimuth[i] < 315 & roof_stats_df$azimuth[i] > 45){
+      usable_roof_area_sqm <- usable_roof_area_sqm + roof_stats_df$roof_segment_panel_count[i] * solar_panel_size_sqm
+      irradiance_times_area <- irradiance_times_area + (roof_stats_df$roof_segment_panel_count[i] * solar_panel_size_sqm * roof_stats_df$roof_segment_irradiance[i])
+    }
+  }
+  
+  # Electricity output = solar irradiance * usable roof area * panel efficiency * performance ratio
+  irradiance_method_solar_potential_kwh <- irradiance_times_area * 0.204 * 0.85
+  
+  ######## OLD VERSION OF GENERATING RESULTS
+  # Initialize variables
+  # flat_roof_area <- 0
+  # south_roof_area <- 0
+  # east_west_roof_area <- 0
+  # north_roof_area <- 0
+  # usable_flat_roof_area <- 0
+  # usable_south_roof_area <- 0
+  # usable_east_west_roof_area <- 0
+  # usable_north_roof_area <- 0
+  # 
+  # 
+  # Loop through the roof segments and calculate area totals
+  # Flat roofing is defined as having pitch less than 10 degrees
+  # Roofing with pitch greater than 45 degrees is disregarded
+  # Azimuth (orientation) is defined with 0 as North, 180 as South
+  # Directions are defined as 90 degree windows centered around the cardinal directions
+  # For example, south is considered between 135 and 225 degrees
+  # Code was perhaps too granular, we'll lump all flat, North, East, and West facing roofing together
+  # for (i in 1:num_roof_segments){
+  #   if (roof_stats_df$pitch[i] >= 45 ){
+  #     next
+  #   }
+  #   if (roof_stats_df$pitch[i] <= 10){
+  #     flat_roof_area <- flat_roof_area + roof_stats_df$roof_area[i]
+  #     usable_flat_roof_area <- usable_flat_roof_area + roof_stats_df$roof_segment_panel_count[i] * solar_panel_size_sqft
+  #   } else if (roof_stats_df$azimuth[i] > 135 && roof_stats_df$azimuth[i] <= 225){
+  #     south_roof_area <- south_roof_area + roof_stats_df$roof_area[i]
+  #     usable_south_roof_area <- usable_south_roof_area + roof_stats_df$roof_segment_panel_count[i] * solar_panel_size_sqft
+  #   } else if (roof_stats_df$azimuth[i] > 45 && roof_stats_df$azimuth[i] <= 135 |
+  #              roof_stats_df$azimuth[i] > 225 && roof_stats_df$azimuth[i] <= 315){
+  #     east_west_roof_area <- east_west_roof_area + roof_stats_df$roof_area[i]
+  #     usable_east_west_roof_area <- usable_east_west_roof_area + roof_stats_df$roof_segment_panel_count[i] * solar_panel_size_sqft
+  #   } else if (roof_stats_df$azimuth[i] > 315 | roof_stats_df$azimuth[i] <= 45){
+  #     north_roof_area <- north_roof_area + roof_stats_df$roof_area[i]
+  #     usable_north_roof_area <- usable_north_roof_area + roof_stats_df$roof_segment_panel_count[i] * solar_panel_size_sqft
+  #   }
+  # }
+  ########
+
+  # Relay the calculated values as output
+  return(c(roof_area_sqm, usable_roof_area_sqm, panel_count, nameplate_capacity, 
+           adjusted_solar_annual_kwh, num_roof_segments, building_height_sealevel))
+}
+
+```
+
+
+# Validation test code 2/18/2025
+
+This code won't work with the above function anymore because it's been altered to write the API response using site ID, which some of these are missing. If you comment out that line of code, this below will work fine
+```{r}
+
+# validation_data <- read.csv('data/solar_api_validation_data.csv') %>%
+#   filter(data_source == 'screening') %>%
+#   select(-c(15:19)) %>% 
+#   rename(site_lat = lat,
+#          site_lon = lon)
+# 
+# validation_data <- validation_data %>%
+#   rowwise() %>% # Process row-by-row
+#   mutate(solar_api_results = list(fetch_solarapi(latitude = site_lat, longitude = site_lon, 
+#                                                  key = api_key))) %>% # Make API call and record results
+#   mutate(roof_area_sqm = solar_api_results[[1]],
+#          usable_roof_area_sqm = solar_api_results[[2]],
+#          aurora_panel_count = solar_api_results[[3]],
+#          aurora_nameplate_capacity = solar_api_results[[4]],
+#          aurora_annual_solar_generation_kwh = solar_api_results[[5]],
+#          num_roof_segments = solar_api_results[[6]],
+#          building_height_sealevel = solar_api_results[[7]]) %>% 
+#   ungroup() %>%
+#   select(-solar_api_results) # Remove column that originally held the data
+  
+```
+
+Test results that would accompany the validation code above
+```{r}
+# test_results <- validation_data %>%
+#   filter(!is.na(validation_data$roof_area_sqm)) %>%
+#   select(site_address, site_lat, site_lon, roof_area, roof_area_sqm, usable_roof_area_sqm, num_roof_segments, panel_count, nameplate_capacity, annual_solar_generation, 
+#          aurora_panel_count, aurora_annual_solar_generation_kwh,irradiance_method_solar_potential_kwh) %>%
+#   mutate(panel_model_comparison = aurora_annual_solar_generation_kwh/annual_solar_generation,
+#          irradiance_model_comparison = irradiance_method_solar_potential_kwh/annual_solar_generation)
+# 
+# print(c(mean(test_results$panel_model_comparison), mean(test_results$irradiance_model_comparison)))
+# Panel modeling overestimated results on average by about  12 percent, the usable roof area method overestimated by 130 percent
+
+```
+
+
+# Packard Plan Test
+```{r}
+# Read in data for the Packard Plan Sites
+first_batch <- read.csv('data/solarapi_batch_nov26/Sites_2024_1313894487973521005.csv')
+second_batch <- read.csv('data/solarapi_batch_nov26/Centers_2023_8353317920455565290.csv')
+
+first_batch_results <- first_batch %>%
+  rename(site_lat = y_sites_rooftop_CEC, site_lon = x_sites_rooftop_CEC) %>%
+  rowwise() %>% # Process row-by-row
+  mutate(solar_api_results = list(fetch_solarapi(latitude = site_lat, longitude = site_lon, 
+                                                 key = api_key))) %>% # Make API call and record results
+  mutate(roof_area_sqm = solar_api_results[[1]],
+         usable_roof_area_sqm = solar_api_results[[2]],
+         aurora_panel_count = solar_api_results[[3]],
+         aurora_nameplate_capacity = solar_api_results[[4]],
+         aurora_annual_solar_generation_kwh = solar_api_results[[5]],
+         num_roof_segments = solar_api_results[[6]],
+         building_height_sealevel = solar_api_results[[7]]) %>% 
+  ungroup() %>%
+  select(-solar_api_results) # Remove column that originally held the data
+
+second_batch_results <- second_batch %>%
+  rename(site_lat = y_centers_rooftop_CEC, site_lon = x_centers_rooftop_CEC) %>%
+  rowwise() %>% # Process row-by-row
+  mutate(solar_api_results = list(fetch_solarapi(latitude = site_lat, longitude = site_lon, 
+                                                 key = api_key))) %>% # Make API call and record results
+  mutate(roof_area_sqm = solar_api_results[[1]],
+         usable_roof_area_sqm = solar_api_results[[2]],
+         aurora_panel_count = solar_api_results[[3]],
+         aurora_nameplate_capacity = solar_api_results[[4]],
+         aurora_annual_solar_generation_kwh = solar_api_results[[5]],
+         num_roof_segments = solar_api_results[[6]],
+         building_height_sealevel = solar_api_results[[7]]) %>% 
+  ungroup() %>%
+  select(-solar_api_results) # Remove column that originally held the data
+
+write.csv(first_batch_results, 'data/solarapi_batch_feb23/Sites_2024_1313894487973521005_solarapi.csv')
+write.csv(second_batch_results, 'data/solarapi_batch_feb23/Centers_2023_8353317920455565290_solarapi.csv')
+
+```
+
+
+# Batch API Calls
+
+If you'd want to generate results in smaller batches, simply run through fewer iterations of the for loop at a time
+
+```{r}
+# for (i in c(1)){ # Will help to split this process into smaller chunks
+#   
+#   iteration_data <- fqhc[((i-1)*10 + 1):(i*10), ] # Standard index case, pulls 10 records at a time
+#   
+#   # Make API Call
+#   iteration_results <- iteration_data %>%
+#     rowwise() %>% # Process row-by-row
+#     mutate(solar_api_results = list(fetch_solarapi(latitude = site_lat, longitude = site_lon, 
+#                                                    site_id = ObjectId, key = api_key))) %>% # Make API call and record results
+#     mutate(roof_area_sqm = solar_api_results[[1]],
+#            usable_roof_area_sqm = solar_api_results[[2]],
+#            aurora_panel_count = solar_api_results[[3]],
+#            aurora_nameplate_capacity = solar_api_results[[4]],
+#            aurora_annual_solar_generation_kwh = solar_api_results[[5]],
+#            num_roof_segments = solar_api_results[[6]],
+#            building_height_sealevel = solar_api_results[[7]]) %>% 
+#     ungroup() %>%
+#     select(-solar_api_results) # Remove column that originally held the data
+#   
+#   # Write results to a csv
+#   write.csv(iteration_results, file.path('data/solarapi_results', paste0('fqhc_solarapi_', i, '.csv')), row.names = FALSE)
+# }
+
+
+```
+
+
+# Generate SolarAPI Results for All Sites
+
+```{r}
+# This code chunk will run SolarAPI for all sites in the database, and save their API responses
+
+for (i in 1 : as.integer(dim(fqhc)[1] / 100) + 1){ # Will help to split this process into smaller chunks
+  if (i == as.integer(dim(fqhc)[1] / 100) + 1){
+    iteration_data <- fqhc[((i-1)*100 + 1):dim(fqhc)[1], ] # Special case for indexing at the end
+  } else {
+    iteration_data <- fqhc[((i-1)*100 + 1):(i*100), ] # Standard case for indexing, pulls 400 records at a time
+  }
+
+  # Make API Call
+  iteration_results <- iteration_data %>%
+    rowwise() %>% # Process row-by-row
+    mutate(solar_api_results = list(fetch_solarapi(latitude = site_lat, longitude = site_lon,
+                                                   site_id = ObjectId, key = api_key))) %>% # Make API call and record results
+    mutate(roof_area_sqm = solar_api_results[[1]],
+           usable_roof_area_sqm = solar_api_results[[2]],
+           aurora_panel_count = solar_api_results[[3]],
+           aurora_nameplate_capacity = solar_api_results[[4]],
+           aurora_annual_solar_generation_kwh = solar_api_results[[5]],
+           num_roof_segments = solar_api_results[[6]],
+           building_height_sealevel = solar_api_results[[7]]) %>%
+    ungroup() %>%
+    select(-solar_api_results) # Remove column that originally held the data
+
+  # Write results to a csv
+  write.csv(iteration_results, file.path('data/solarapi_results', paste0('fqhc_solarapi_', i, '.csv')), row.names = FALSE)
+}
+
+
+```
+
+
+Run this code to append all new data to the overall FQHC data file
+Does not require the above code if the data is already present
+
+```{r}
+# Initialize an empty data frame
+solarapi_results_all <- data.frame()
+
+# Populate with solarapi results
+for (i in list.files(file.path('data/solarapi_results'))){
+  solarapi_results_all <- rbind(solarapi_results_all, read.csv(file.path('data/solarapi_results', i)))
+}
+
+solarapi_results_all <- solarapi_results_all %>%
+  select(ObjectId, roof_area_sqm, usable_roof_area_sqm, aurora_panel_count,
+         aurora_nameplate_capacity, aurora_annual_solar_generation_kwh, 
+         num_roof_segments, building_height_sealevel) %>% # Only care about these columns
+  rename(solarapi_panel_count = aurora_panel_count,
+         solarapi_nameplate_capacity = aurora_nameplate_capacity,
+         solarapi_annual_solar_generation_kwh = aurora_annual_solar_generation_kwh)
+
+write.csv(solarapi_results_all, 'data/solarapi_results_total.csv', row.names = FALSE)
+
+fqhc_output <- read.csv('data/data_layers_jan20.csv')
+
+# Join results with original data
+fqhc_output <- fqhc_output %>%
+  left_join(solarapi_results_all, by = 'ObjectId')
+
+write.csv(fqhc_output, 'data/data_layers_mar1.csv', row.names = FALSE) # Write final output
+
+```
+

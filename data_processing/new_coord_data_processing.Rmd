@@ -1,0 +1,463 @@
+---
+title: "Updated Coordinate Site Processing"
+author: "Henry Strecker"
+date: "2025-05-07"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, warning=FALSE}
+library(tidyverse)
+library(sf)
+library(readxl)
+library(here)
+library(tidycensus)
+library(stringi)
+library(tigris)
+library(dplyr)
+library(httr)
+library(jsonlite)
+
+```
+
+## Any manual updates to the script should happen in the following code chunk
+
+```{r}
+
+# Here is the file path for the existing dashboard data
+existing_data_path <- file.path('C:/Users/INSERT YOUR FILEPATH HERE/finalized_dashboard_data.csv')
+
+# Here is the file path for the corrective survey data
+survey_data_path <- file.path('C:/Users/Hank1/Documents/Collective Energy/code/data/corrective_survey_data.csv')
+
+# Provide a file path where the output data can be written
+output_data_path <-  file.path('C:/Users/Hank1/Documents/Collective Energy/code/data/new_coord_data.csv')
+
+# Provide the file path for the entire directory that contains the project's data
+project_path <- file.path('C:/Users/Hank1/Documents/Collective Energy/code/')
+
+# Supply the SolarAPI key from Google Cloud
+solar_api_key <- 'REDACTED'
+
+```
+
+
+```{r}
+# Read in and clean new coordinate data
+new_coord_data <- read.csv(survey_data_path) %>%
+  separate(site_coordinates, into = c("site_lat", "site_lon"), sep = ",\\s*") %>%
+  mutate(across(c(site_lat, site_lon), as.numeric)) %>%
+  select(object_id, site_lat, site_lon) %>%
+  rename(ObjectId = object_id)
+
+new_coord_data <- data.frame(ObjectId = 1, site_lat = 34.42683278655096, site_lon = -119.6967979109719)
+
+# Join new coordinates with existing site data
+existing_sites <- read.csv(existing_data_path)
+
+updated_coord_base <- new_coord_data %>%
+  left_join(existing_sites %>% select(-site_lat, -site_lon), by = "ObjectId") %>%
+  select(ObjectId, BPHC_Assigned_Number, Site_Name, Site_Address, Site_City, Site_State_Abbreviation, State_Name, Site_Postal_Code,
+         Complete_County_Name, County_Equivalent_Name, TotalPatients, TotalMale, TotalFemale, Asian, Black, AmerIn_AKNative, White,
+         MultRace, UnreportedRace, Hispanic, NonHispanic, UnreportedEthnicity, FPL_100_Percent_and_Below, FPL_101_150_Percent, 
+         FPL_151_200_Percent, FPL_Over_200_Percent, FPL_Unknown, Uninsured, Medicaid, Medicare, PublicIns, PrivateIns, 
+         FEMA_NRI_Risk_Score, site_lat, site_lon)
+
+
+```
+
+
+# Define SolarAPI data call
+
+```{r}
+
+# Define a function similar to previous iterations that focuses on using the panel model to generate SolarAPI responses for each site
+fetch_solarapi <- function(latitude, longitude, site_id, key){
+  Sys.sleep(0.11) # Sleep for a fraction of a second so as to not to exceed the API request limit (600/min)
+  
+  # Call the API to get results for a given site
+  solar_api_test <- GET(paste0('https://solar.googleapis.com/v1/buildingInsights:findClosest?location.latitude=', latitude, 
+                               '&location.longitude=', longitude, '&requiredQuality=HIGH&key=', key))
+  
+  # Convert JSON to tabular format
+  test_data <- fromJSON(rawToChar(solar_api_test$content))
+  
+  # Check if the requiredQuality=HIGH parameter was met, if not run requiredQuality=MEDIUM
+  if (!is.null(test_data$error$message) && test_data$error$message == 'Requested entity was not found.'){
+    solar_api_test <- GET(paste0('https://solar.googleapis.com/v1/buildingInsights:findClosest?location.latitude=', latitude, 
+                                 '&location.longitude=', longitude, '&requiredQuality=MEDIUM&key=', key))
+  
+    # Convert JSON to tabular format
+    test_data <- fromJSON(rawToChar(solar_api_test$content))
+  }
+  
+  # Check if the requiredQuality=MEDIUM parameter was met, if not run requiredQuality=LOW
+  if (!is.null(test_data$error$message) && test_data$error$message == 'Requested entity was not found.'){
+    solar_api_test <- GET(paste0('https://solar.googleapis.com/v1/buildingInsights:findClosest?location.latitude=', latitude, 
+                                 '&location.longitude=', longitude, '&requiredQuality=LOW&key=', key))
+  
+    # Convert JSON to tabular format
+    test_data <- fromJSON(rawToChar(solar_api_test$content))
+  }
+  
+  # Deal with edge case where API doesn't pass due to an API restriction
+  while (!is.null(test_data$error$message) && grepl('IP address restriction', test_data$error$message)){
+    solar_api_test <- GET(paste0('https://solar.googleapis.com/v1/buildingInsights:findClosest?location.latitude=', latitude, 
+                                 '&location.longitude=', longitude, '&requiredQuality=LOW&key=', key))
+  
+    # Convert JSON to tabular format
+    test_data <- fromJSON(rawToChar(solar_api_test$content))
+  }
+  
+  # Handle case where there are insufficient/missing SolarAPI results - no data returned here
+  if (is.null(test_data$solarPotential) & length(test_data$solarPotential$maxArrayPanelsCount) == 0){
+    return(rep(NA, 8)) # In case SolarAPI doesn't produce results for a site
+  } else if (is.null(test_data$solarPotential$maxArrayPanelsCount) || test_data$solarPotential$maxArrayPanelsCount < 10){
+    return(rep(NA, 8)) # In case SolarAPI can't place a minimum of 10 panels on a roof
+  }
+  
+  # Maximum number of panels from api call
+  max_panels <- as.numeric(test_data$solarPotential$maxArrayPanelsCount)
+  
+  # Total roof area in square feet from api call converted from square meters
+  roof_area_sqft <- test_data$solarPotential$wholeRoofStats$areaMeters2 * 10.7639
+  roof_area_sqm <- test_data$solarPotential$wholeRoofStats$areaMeters2
+  
+  # Store the master set of panel configurations and solar output for this site
+  panels_generation <- test_data$solarPotential$solarPanelConfigs
+  
+  # Define roof size indicator variables for the panel modeling prediction
+  if (roof_area_sqft <= 7000){
+    small_area <- 1
+    medium_area <- 0
+  } else if (roof_area_sqft <= 15000){
+    small_area <- 0
+    medium_area <- 1
+  } else {
+    small_area <- 0
+    medium_area <- 0
+  }
+  
+  # Estimate true number of panels based on max_panels and roof area using the linear regression model
+  panel_prediction <- unname(predict(panels_model, list(max_panel_count = max_panels, small_site = small_area, medium_site = medium_area)))
+  
+  # Extracts the configuration that matches the number of panels modeled above
+  annual_solar_generation <- panels_generation[panels_generation$panelsCount == panel_prediction, ]
+  panel_count <- panel_prediction
+
+  # If the number of modeled panels doesn't exactly match with the API call, this will find the next closest match
+  if (dim(annual_solar_generation)[1] == 0){
+    panel_count <- panels_generation$panelsCount[which.min(abs(panels_generation$panelsCount - panel_prediction))]
+    annual_solar_generation <- panels_generation[panels_generation$panelsCount == panel_count, ]
+  }
+  
+  nameplate_capacity <- panel_count * 400 / 1000 # 400W panels, scaled to kW from W
+  
+  # Generate true solar production potential, based on 400W panels and solar generation similar to Aurora screenings (scale at 88.5%)
+  adjusted_solar_annual_kwh <- annual_solar_generation$yearlyEnergyDcKwh * (0.885)
+  
+  # Relevant number of roof segments - meant for solving issue with residential buildings that have roof segments that can't house panels
+  roof_segment_count <- as.numeric(length(pull(tail(test_data$solarPotential$solarPanelConfigs$roofSegmentSummaries, 1)[[1]]['panelsCount'])))
+  
+  # Calculate roof height ine meters above sea level, taking the average across all roof segments
+  building_height_sealevel <- mean(test_data$solarPotential$roofSegmentStats$planeHeightAtCenterMeters)
+  
+  # Extract median irradiance for each roof segment
+  median_irradiance <- c()
+  for (i in 1 : roof_segment_count){
+    n_breaks <- length(test_data$solarPotential$roofSegmentStats$stats$sunshineQuantiles[[i]]) # Number of breaks for percentile calculations
+    median_irradiance <- c(median_irradiance, test_data$solarPotential$roofSegmentStats$stats$sunshineQuantiles[[i]][n_breaks %/% 2 + 1]) # Ensures median is extracted
+  }
+  
+  # Create roof area data for how much of the roof faces each direction
+  roof_stats <- test_data$solarPotential$roofSegmentStats
+  roof_stats_df <- data.frame(pitch = head(roof_stats$pitchDegrees, roof_segment_count),
+                              azimuth = head(roof_stats$azimuthDegrees, roof_segment_count),
+                              roof_area_sqm = head(roof_stats$stats$areaMeters2, roof_segment_count),
+                              roof_segment_panel_count = pull(tail(test_data$solarPotential$solarPanelConfigs$roofSegmentSummaries, 1)[[1]]['panelsCount']),
+                              roof_segment_irradiance = median_irradiance)
+  
+  solar_panel_size_sqm <- test_data$solarPotential$panelHeightMeters * test_data$solarPotential$panelWidthMeters
+  num_roof_segments <- as.numeric(dim(roof_stats_df)[1])
+  
+  # Initialize variables
+  usable_roof_area_sqm <- 0
+  irradiance_times_area <- 0
+  
+  # Calculate total roof summary statistics
+  for (i in 1:dim(roof_stats_df)[1]){
+    if (roof_stats_df$pitch[i] <= 10){ # Included because flat roofs are given azimuth of 0
+      usable_roof_area_sqm <- usable_roof_area_sqm + roof_stats_df$roof_segment_panel_count[i] * solar_panel_size_sqm
+      irradiance_times_area <- irradiance_times_area + (roof_stats_df$roof_segment_panel_count[i] * solar_panel_size_sqm * roof_stats_df$roof_segment_irradiance[i])
+    } else if (roof_stats_df$pitch[i] <= 45 & roof_stats_df$azimuth[i] < 315 & roof_stats_df$azimuth[i] > 45){
+      usable_roof_area_sqm <- usable_roof_area_sqm + roof_stats_df$roof_segment_panel_count[i] * solar_panel_size_sqm
+      irradiance_times_area <- irradiance_times_area + (roof_stats_df$roof_segment_panel_count[i] * solar_panel_size_sqm * roof_stats_df$roof_segment_irradiance[i])
+    }
+  }
+  
+  # Electricity output = solar irradiance * usable roof area * panel efficiency * performance ratio
+  irradiance_method_solar_potential_kwh <- irradiance_times_area * 0.204 * 0.85
+  
+  # Relay the calculated values as output
+  return(c(roof_area_sqm, usable_roof_area_sqm, panel_count, nameplate_capacity, 
+           adjusted_solar_annual_kwh, num_roof_segments, building_height_sealevel))
+}
+
+
+```
+
+# Generate updated SolarAPI results
+
+```{r}
+
+# Panel count linear regression model
+panels_model <- readRDS(file.path(project_path, 'data/panel_count_model.rds'))
+
+# Call SolarAPI for updated sites
+updated_coord_solar_api <- updated_coord_base %>%
+  rowwise() %>% # Process row-by-row
+  mutate(solar_api_results = list(fetch_solarapi(latitude = site_lat, longitude = site_lon, 
+                                                 key = solar_api_key))) %>% # Make API call and record results
+  mutate(roof_area_sqm = solar_api_results[[1]],
+         usable_roof_area_sqm = solar_api_results[[2]],
+         aurora_panel_count = solar_api_results[[3]],
+         aurora_nameplate_capacity = solar_api_results[[4]],
+         aurora_annual_solar_generation_kwh = solar_api_results[[5]],
+         num_roof_segments = solar_api_results[[6]],
+         building_height_sealevel = solar_api_results[[7]]) %>% 
+  ungroup() %>%
+  select(-solar_api_results) %>% # Remove column that originally held the data
+  rename(solarapi_panel_count = aurora_panel_count,
+         solarapi_nameplate_capacity = aurora_nameplate_capacity,
+         solarapi_annual_solar_generation_kwh = aurora_annual_solar_generation_kwh)
+
+```
+
+
+### Add County FIPS Codes
+```{r}
+# Use tidycensus to get fips code data
+fips_code_data <- force(fips_codes) %>% # Comes from tidycensus
+  rename(State_Name = state_name,
+         Complete_County_Name = county) %>%
+  mutate(fips_code = paste0(state_code, county_code),
+         Complete_County_Name = str_replace_all(Complete_County_Name, 'city', 'City'), # Fix edge case
+         Complete_County_Name = str_replace_all(Complete_County_Name, 'City and ', '')) %>% # Fix edge case
+  select(-state, -state_code, -county_code)
+
+# Join fips codes and manually account for some edge cases of non-matches
+updated_coord_solar_api <- updated_coord_solar_api %>% left_join(fips_code_data, by = c('State_Name', 'Complete_County_Name')) %>%
+  mutate(fips_code = case_when(
+    (Site_State_Abbreviation == 'PR' & Complete_County_Name == "Bayamo'n Municipio") ~ '72021',
+    (Site_State_Abbreviation == 'PR' & Complete_County_Name == "lsabela Municipio") ~ '72071',
+    (Site_State_Abbreviation == 'AK' & Complete_County_Name == "Wrangell City and Borough") ~ '02275',
+    (Site_State_Abbreviation == 'AK' & Complete_County_Name == "Anchorage Borough") ~ '02020',
+    (Site_State_Abbreviation == 'NM' & Complete_County_Name == "Not Determined") ~ '35049',
+    (Site_State_Abbreviation == 'OK' & Complete_County_Name == "Not Determined") ~ '40109',
+    (Site_State_Abbreviation == 'IN' & Complete_County_Name == "La Porte County") ~ '18091',
+    (Site_State_Abbreviation == 'IL' & Complete_County_Name == "La Salle County") ~ '17099',
+    TRUE ~ fips_code
+  ))
+
+```
+
+
+### Add Tax Incentive Qualification
+```{r}
+# Read in the two shapefiles of interest to intersect with
+# Both of these files share the same CRS
+msa_areas <- st_read(file.path(project_path, 'data/Shapefiles/2024_msa.shp'))
+coal_closures <- st_read(file.path(project_path, 'data/Shapefiles/coal_closure.shp'))
+
+# Convert the FQHC site coordinates to a geometry/feature and adjust CRS to match with the shapefiles above
+site_coords <- st_as_sf(updated_coord_solar_api, coords = c('site_lon', 'site_lat'), crs = 4326) %>%
+  st_transform(crs = st_crs(msa_areas))
+
+# Create logical columns indicating whether the site intersects each layer
+site_coords$in_coal_closure <- lengths(st_intersects(site_coords, coal_closures)) > 0
+site_coords$in_msa_area <- lengths(st_intersects(site_coords, msa_areas)) > 0
+
+# Create column that combines the last two and tells us T/F whether the site qualifies for extra incentive
+site_coords$energy_community <- site_coords$in_coal_closure | site_coords$in_msa_area
+
+# Format results before exporting
+tax_incentive_classification <- site_coords %>%
+  select(ObjectId, energy_community) %>%
+  st_drop_geometry()
+
+updated_coord_solar_api <- updated_coord_solar_api %>%
+  left_join(tax_incentive_classification, by = 'ObjectId')
+
+```
+
+
+### Add Health Equity
+```{r}
+# Read in health equity data
+health_equity <- read.csv(file.path(project_path, 'data/raw/Health_equity.csv')) %>%
+  mutate(county_code = sprintf("%05d", county_code)) %>% # Format fips code appropriately
+  rename(fips_code = county_code,
+         health_aggregate_percentile = total_percentile) %>%
+  select(-total)
+
+updated_coord_solar_api <- updated_coord_solar_api %>%
+  left_join(health_equity, by = 'fips_code')
+
+```
+
+
+### Add Power Outage Risk
+```{r}
+
+# Draw the most recent power outage data for joining the results with clinic data
+power_outage_summary <- read.csv(file.path(project_path, 'data/outage_results/outages_by_county_master.csv')) %>%
+  group_by(fips_code) %>%
+  slice_max(order_by = year, n = 1) %>% # Selects the most recent available data for each county
+  ungroup() %>%
+  filter(year >= 2019) %>% # Set the lower limit of data we're willing to accept, earlier years had poor coverage
+  select(fips_code, saidi, total_customers)
+
+long_outage_count <- read.csv(file.path(project_path, 'data/outage_results/outage_summaries_2023.csv')) %>%
+  filter(total_duration_minutes >= 240) %>% # Filter for outages longer than 4 hours
+  group_by(fips_code) %>%
+  summarize(customers_impacted = sum(total_customers_impacted)) %>% # Calculates number of customers experiencing these long outages
+  ungroup()
+
+relevant_outage_info <- power_outage_summary %>%
+  left_join(long_outage_count, by = 'fips_code') %>%
+  mutate(long_outage_expectation = customers_impacted / total_customers, # Calculates the frequency at which the average customer would experience long outages annually
+         fips_code = sprintf("%05d", fips_code)) %>% # Formatting
+  select(-customers_impacted, -total_customers)
+
+updated_coord_solar_api <- updated_coord_solar_api %>%
+  left_join(relevant_outage_info, by = 'fips_code')
+
+```
+
+
+### Add Rural Community DOE Distinction
+```{r, warning=FALSE, message=FALSE}
+
+# Create link for site city population
+site_population <- new_coord_data %>%
+  left_join(existing_sites %>% select(-site_lat, -site_lon), by = "ObjectId") %>%
+  select(ObjectId, site_city_population_2020, community_rural_doe)
+
+# Combine finalized data
+updated_coord_census <- updated_coord_solar_api %>%
+  left_join(site_population, by = 'ObjectId') # Join finalized population data
+
+```
+
+
+### Add MUA Classification
+```{r}
+mua_designation <- read.csv(file.path(project_path, 'data/mua_designation.csv')) %>%
+  mutate(fips_code = sprintf("%05d", fips_code))
+
+updated_coord_census <- updated_coord_census %>%
+  left_join(mua_designation, by = 'fips_code') %>%
+  mutate(mua = case_when(mua == TRUE ~ TRUE, # Keeps original data the same
+                         TRUE ~ FALSE)) # Assigns FALSE to counties that didn't match
+
+```
+
+
+### Add Utility Rate by State
+```{r}
+utility_rate <- read.csv(file.path(project_path, 'data/raw/state_utility_rate.csv')) %>%
+  rename('State_Name' = 'X')
+
+updated_coord_census <- updated_coord_census %>%
+  left_join(utility_rate, by = 'State_Name') %>%
+  mutate(utility_rate = replace_na(utility_rate, 20),
+         utility_rate = round(utility_rate/100, digits = 2)) # Standard rate for non-recorded regions like PR
+```
+
+
+### Final Step: Financial Calculations and ZScores
+```{r}
+
+# Perform calculations on static clinic_data
+updated_coord_census <- updated_coord_census %>%
+  rowwise() %>%
+  mutate( # Create default values for financial fields of interest
+    roof_area_sqft = roof_area_sqm * 10.7639, # Standard conversion
+    annual_energy_consumption_kwh = roof_area_sqft * 12, # Uses 12 kWh/sqft per year for energy consumption
+    monthly_energy_consumption_kwh = annual_energy_consumption_kwh / 12,
+    peak_power_use_kw = annual_energy_consumption_kwh / 2750, # This factor is based on the mean of about 35 screening sites
+    solar_system_cost = (solarapi_nameplate_capacity * 1000 * 3), # Calculate how much the system would cost before CE's fee and incentives at a rate of $3 per Watt
+    solar_install_cost = (solar_system_cost * (1 - (0.3 + 0.1 * energy_community))) + solar_system_cost * 0.12, # Accounts for CE's fee and incentives
+    vaccine_value = roof_area_sqft * 20,  # Assumed that there's $20 worth of refrigerated value per sqft
+    patients_seen_hourly = (roof_area_sqft * 3) / 1000, # Assumed that there's roughly 3 patients per 1000 sqft per hour
+    annual_solar_savings = solarapi_annual_solar_generation_kwh * utility_rate,
+    lifetime_solar_savings = map_dbl(annual_solar_savings, ~ round(sum(.x / (1.05^(1:25))), 0)), # Calculates present value with the indexed interest rate
+    lifetime_solar_maintenance_costs = map_dbl(solarapi_nameplate_capacity, ~ round(sum((.x * 50) / (1.05^(1:25))), 0)), # Calculates present value with the indexed interest rate
+    net_present_value_solar = lifetime_solar_savings - solar_install_cost - lifetime_solar_maintenance_costs,
+    battery_size_kwh = peak_power_use_kw * 8, # Capacity is set as 8 hours of their peak usage
+    battery_system_cost = (battery_size_kwh * 1100 + peak_power_use_kw * 3220), # Cost for just the battery system, pre-install
+    battery_install_cost = battery_system_cost * (1 - 0.3 - 0.1 * energy_community) + battery_system_cost * 0.12, # Total cost, including incentives and CE's fee
+    lifetime_battery_savings = map2_dbl(patients_seen_hourly, vaccine_value, ~ round(sum((.x * saidi / 60 * 311 + long_outage_expectation * .y) / (1.05^(1:15))), 0)), # Present value is calculated over a lifetime of 15 years, and the assumed revenue per patient visit is $311, an average from Capital Link
+    lifetime_battery_maintenance = map_dbl(battery_size_kwh, ~ round(sum((.x * 10) / (1.05^(1:15))), 0)), # Assumed maintenance of $10/kWh each year
+    net_present_value_battery = lifetime_battery_savings - battery_install_cost - lifetime_battery_maintenance) %>%
+  ungroup() %>% # Stop rowwise operations
+  mutate(
+    # Calculate zscores for non-monetary variables
+    zscore_avg_baseline_health = as.numeric(scale(avg_baseline_health)),
+    zscore_avg_baseline_environment = as.numeric(scale(avg_baseline_environment)),
+    zscore_avg_climate_change_health = as.numeric(scale(avg_climate_change_health)),
+    zscore_mdi_percentile = as.numeric(scale(mdi_percentile)),
+    zscore_fema_nri = as.numeric(scale(FEMA_NRI_Risk_Score)),
+    community_rural_doe = (community_rural_doe == 'Yes'), # Convert to TRUE/FALSE
+    zscore_rural = as.numeric(scale(community_rural_doe)),
+    zscore_mua = as.numeric(scale(mua))
+    )
+
+# Calculate zscores for SAIDI to represent outage risk; needs to be done externally so it's not impacted by frequency of sites in certain counties
+zscore_saidi <- read.csv(file.path(project_path, 'data/outage_results/outages_by_county_master.csv')) %>%
+  mutate(fips_code = sprintf("%05d", fips_code)) %>%
+  group_by(fips_code) %>%
+  slice_max(order_by = year, n = 1) %>% # Selects the most recent available data for each county
+  ungroup() %>%
+  filter(year >= 2019) %>% # Set the lower limit of data we're willing to accept, earlier years had poor coverage
+  drop_na() %>% # One row was coming in as NA likely due to a missing value for MCC (modeled customer count)
+  mutate(zscore_saidi = as.numeric(scale(saidi))) %>% # Calculate zscore based on the values present
+  select(fips_code, zscore_saidi) # Select only the column of interest and the join column
+
+# Join newly calculated zscore for SAIDI
+updated_coord_census <- updated_coord_census %>%
+  left_join(zscore_saidi, by = 'fips_code')
+
+```
+
+
+### Maintain Excluded Column
+```{r, warning=FALSE, message=FALSE}
+
+# Create link for site city population
+excluded_sites <- new_coord_data %>%
+  left_join(existing_sites %>% select(-site_lat, -site_lon), by = "ObjectId") %>%
+  select(ObjectId, exclude_site)
+
+# Combine finalized data
+updated_coord_census <- updated_coord_census %>%
+  left_join(excluded_sites, by = 'ObjectId') %>% # Join finalized population data
+  mutate(fips_code = as.numeric(fips_code))
+
+```
+
+
+## Integrate new results to existing data and write results
+
+```{r}
+
+final_output_data <- rows_update(existing_sites, updated_coord_census, by = "ObjectId")
+
+write.csv(final_output_data, file.path(output_data_path), row.names = FALSE)
+  
+```
+

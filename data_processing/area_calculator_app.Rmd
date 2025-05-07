@@ -1,0 +1,121 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(leaflet)
+library(leaflet.extras)
+library(sp)
+library(htmlwidgets)
+
+# Function to calculate the area of a polygon in square feet
+calculate_area_sqft <- function(latlngs) {
+  if (length(latlngs) < 3) return(0)
+  
+  # Create a spatial polygon
+  polygon <- Polygon(latlngs)
+  polygons <- Polygons(list(polygon), "polygon1")
+  spatial_polygons <- SpatialPolygons(list(polygons))
+  
+  # Calculate the area in square meters
+  area_sqm <- rgeos::gArea(spatial_polygons, byid = TRUE)
+  
+  # Convert square meters to square feet (1 square meter = 10.7639 square feet)
+  area_sqft <- area_sqm * 10.7639
+  return(area_sqft)
+}
+
+# Add custom CSS for smaller vertex points
+html_custom_css <- "
+<style>
+  .leaflet-edit-marker {
+    width: 8px !important;
+    height: 8px !important;
+  }
+</style>
+"
+
+# Create the leaflet map
+map <- leaflet() %>%
+  addProviderTiles(providers$OpenStreetMap) %>%
+  setView(lng = -96.9, lat = 37.6, zoom = 4) %>%  # Center on the continental United States
+  addDrawToolbar(
+    targetGroup = "draw",
+    polylineOptions = FALSE,
+    polygonOptions = drawPolygonOptions(
+      showArea = TRUE,
+      shapeOptions = list(
+        color = '#3388ff',
+        weight = 4,
+        opacity = 1,
+        fill = TRUE,
+        fillColor = NULL,
+        fillOpacity = 0.2,
+        clickable = TRUE,
+        smoothFactor = 1,
+        noClip = FALSE
+      )
+    ),
+    rectangleOptions = FALSE,
+    circleOptions = FALSE,
+    markerOptions = FALSE,
+    editOptions = editToolbarOptions(
+      selectedPathOptions = selectedPathOptions()
+    )
+  ) %>%
+  addLayersControl(
+    overlayGroups = c("draw"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) %>%
+  addSearchOSM(options = searchOptions(collapsed = FALSE, position = "topleft")) %>%  # Move search bar to top left
+  onRender("
+    function(el, x) {
+      var map = this;
+      
+      function calculateAndAlertArea(layer) {
+        var latlngs = layer.getLatLngs()[0];
+        var area = 0;
+        if (latlngs.length > 2) {
+          var coordinates = latlngs.map(function(latlng) {
+            return [latlng.lat, latlng.lng];
+          });
+          var poly = L.polygon(coordinates);
+          area = L.GeometryUtil.geodesicArea(poly.getLatLngs()[0]) * 10.7639; // Convert to square feet
+        }
+        alert('The area of the polygon is: ' + area.toFixed(2) + ' square feet');
+      }
+      
+      map.on('draw:created', function(e) {
+        var type = e.layerType,
+            layer = e.layer;
+        if (type === 'polygon') {
+          calculateAndAlertArea(layer);
+        }
+        map.addLayer(layer);
+      });
+
+      map.on('draw:edited', function(e) {
+        var layers = e.layers;
+        layers.eachLayer(function(layer) {
+          calculateAndAlertArea(layer);
+        });
+      });
+    }
+  ")
+
+# Print the map and include the custom CSS
+htmltools::tagList(
+  htmltools::HTML(html_custom_css),
+  map
+)
+
+
+
+```
+
+
+
+
+
+

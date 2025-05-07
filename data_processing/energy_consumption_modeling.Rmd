@@ -1,0 +1,91 @@
+---
+title: "Panel Count and Energy Consumption Modeling"
+author: "Henry Strecker"
+date: "2025-02-03"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(readxl)
+library(janitor)
+
+```
+
+```{r}
+# Read data and filter for what we care about
+patient_counts <- read.csv('data/data_layers_jan20.csv') %>%
+  select(TotalPatients, ObjectId) %>%
+  rename(object_id = ObjectId, patient_count = TotalPatients)
+
+# Read training data in (screening) remove bad formatting, and join with patient count
+train_data <- read.csv('data/solar_api_validation_data.csv') %>% 
+  filter(data_source == 'screening') %>% 
+  select(-c(17,18,19)) %>%
+  left_join(patient_counts, by = 'object_id') %>%
+  filter(!is.na(object_id))
+
+# Draw out roof area for the solarAPI results, to be used with the rest of the screening data
+site_roof_area <- read.csv('data/solar_api_validation_data.csv') %>%
+  filter(data_source == 'solar_api') %>%
+  select(roof_area, object_id)
+
+# Append new data in place of the screening data, remember we want to model actual energy consumption based on solar api results
+train_data <- train_data %>%
+  select(-roof_area) %>%
+  left_join(site_roof_area, by = 'object_id') %>%
+  filter(!is.na(roof_area)) %>%
+  clean_names()
+
+```
+
+
+```{r}
+energy_use_modeling <- lm(data = train_data, annual_energy_consumption ~ patient_count + roof_area)
+summary(energy_use_modeling)
+
+```
+
+
+```{r}
+train_data2 <- train_data %>%
+  mutate(roof_size = cut(roof_area, 
+                        breaks = c(-Inf, 6000, 20000, Inf), 
+                        labels = c("small_site", "medium_site", "large_site")),
+         small_site = as.integer(roof_size == "small_site"),
+         medium_site = as.integer(roof_size == "medium_site"),
+         large_site = as.integer(roof_size == "large_site"))
+
+energy_use_modeling2 <- lm(data = train_data2, annual_energy_consumption ~ patient_count + roof_area + small_site + medium_site)
+summary(energy_use_modeling2)
+
+
+```
+
+
+### Panel Count Modeling
+```{r}
+data_panels <- read.csv('data/solar_api_validation_data.csv') %>% 
+  filter(data_source == 'solar_api',
+         !is.na(max_panel_count)) %>% 
+  select(-c(17,18,19)) %>% # Remove bad excel formatting that caused new cols
+  mutate(roof_size = cut(roof_area, 
+                        breaks = c(-Inf, 7000, 15000, Inf), # Roof size cutoffs in sqft, these were most optimal after testing
+                        labels = c("small_site", "medium_site", "large_site")),
+         small_site = as.integer(roof_size == "small_site"),
+         medium_site = as.integer(roof_size == "medium_site")) # One-hot encoding
+
+panels_model <- lm(data = data_panels, panel_count ~ max_panel_count + small_site + medium_site)
+summary(panels_model)
+
+saveRDS(panels_model, file = 'data/panel_count_model.rds')
+```
+
+
+
+

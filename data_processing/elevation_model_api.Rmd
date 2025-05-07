@@ -1,0 +1,76 @@
+---
+title: "Elevation Model API"
+author: "Henry Strecker"
+date: "2025-03-01"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(httr)
+library(jsonlite)
+library(tidyverse)
+```
+
+
+```{r}
+fqhc <- read.csv('data/data_layers_mar1.csv')
+
+fetch_epqs <- function(site_lat, site_lon){
+  GET(paste0('https://epqs.nationalmap.gov/v1/json?x=', site_lat, '&y=', site_lon, '&wkid=4326&units=Meters&includeDate=false'))
+}
+
+```
+
+
+```{r}
+
+fetch_elevation <- function(latitude, longitude){
+
+  response <- GET(paste0('https://epqs.nationalmap.gov/v1/json?x=', longitude, '&y=', latitude, '&wkid=4326&units=Meters&includeDate=false'))
+  
+  # Fix the case where results don't generate
+  while(grepl('Call failed', response) || 
+        !startsWith(content(response, "text", encoding = "UTF-8"), "{")){
+    response <- GET(paste0('https://epqs.nationalmap.gov/v1/json?x=', longitude, '&y=', latitude, '&wkid=4326&units=Meters&includeDate=false'))
+  }
+  
+  while (!startsWith(content(response, "text", encoding = "UTF-8"), "{")) {
+    response <- GET(paste0('https://epqs.nationalmap.gov/v1/json?x=', longitude, '&y=', latitude, '&wkid=4326&units=Meters&includeDate=false'))
+
+  }
+  
+  response_data <- content(response, "text", encoding = "UTF-8")
+  elevation <- fromJSON(response_data)$value
+  return(as.numeric(elevation))
+}
+
+
+```
+
+
+```{r, warning = FALSE, message = FALSE}
+
+site_ground_elevation <- fqhc %>%
+  select(ObjectId, site_lon, site_lat) %>% # Select variables we care about
+  rowwise() %>% # Process row-by-row
+  mutate(site_ground_elevation = fetch_elevation(latitude = site_lat, longitude = site_lon)) # Make API call and record results
+
+write.csv(site_ground_elevation, 'data/ground_elevation.csv')
+
+```
+
+
+```{r}
+ground_elevation <- read.csv('data/ground_elevation.csv') %>%
+  select(ObjectId, site_ground_elevation)
+
+fqhc <- read.csv('data/data_layers_mar1.csv') %>%
+  left_join(ground_elevation, by = 'ObjectId') %>%
+  mutate(building_height_ft = (building_height_sealevel - ground_elevation)*3.28084)
+
+```
+
+
+

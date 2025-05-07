@@ -1,0 +1,469 @@
+---
+title: "Combine Datasets for Final Use"
+author: "Henry Strecker"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, warning=FALSE}
+library(tidyverse)
+library(sf)
+library(readxl)
+library(here)
+library(tidycensus)
+library(stringi)
+library(tigris)
+library(dplyr)
+
+```
+
+This script will serve to combine all of the Solstice Health data together into its final form for use in the final shiny app.
+The base data is the FQHC sites and we will be adding all of the other information in here based on county fips or in the case of federal incentives, overlap with those specified regions.
+
+
+### Set Up Default FQHC Data
+```{r}
+# Read in default site data - everything else will be added on top of this
+fqhc_base <- read.csv('data/fqhc_site_august_14_2024.csv') %>%
+  select(ObjectId, BPHC_Assigned_Number, Site_Name, Site_Address, Site_City, Site_State_Abbreviation, State_Name, Site_Postal_Code,
+         Complete_County_Name, County_Equivalent_Name, TotalPatients, TotalMale, TotalFemale, Asian, Black, AmerIn_AKNative, White,
+         MultRace, UnreportedRace, Hispanic, NonHispanic, UnreportedEthnicity, FPL_100_Percent_and_Below, FPL_101_150_Percent, 
+         FPL_151_200_Percent, FPL_Over_200_Percent, FPL_Unknown, Uninsured, Medicaid, Medicare, PublicIns, PrivateIns, FEMA_NRI_Risk_Score, y, x) %>% 
+  rename(site_lat = y, site_lon = x) # Format existing coordinate data
+
+# NEED TO INCLUDE THE NEW ~2500 SITES HERE WITH THE SAME COLUMNS AS ABOVE
+# new_sites <- read.csv(TEMPORARY)
+# 
+# all_sites <- fqhc_base %>%
+#   rbind(new_sites)
+
+all_sites <- fqhc_base # TEMPORARY
+```
+
+
+### Add County FIPS Codes
+```{r}
+# Use tidycensus to get fips code data
+fips_code_data <- force(fips_codes) %>% # Comes from tidycensus
+  rename(State_Name = state_name,
+         Complete_County_Name = county) %>%
+  mutate(fips_code = paste0(state_code, county_code),
+         Complete_County_Name = str_replace_all(Complete_County_Name, 'city', 'City'), # Fix edge case
+         Complete_County_Name = str_replace_all(Complete_County_Name, 'City and ', '')) %>% # Fix edge case
+  select(-state, -state_code, -county_code)
+
+# Join fips codes and manually account for some edge cases of non-matches
+all_sites <- all_sites %>% left_join(fips_code_data, by = c('State_Name', 'Complete_County_Name')) %>%
+  mutate(fips_code = case_when(
+    (Site_State_Abbreviation == 'PR' & Complete_County_Name == "Bayamo'n Municipio") ~ '72021',
+    (Site_State_Abbreviation == 'PR' & Complete_County_Name == "lsabela Municipio") ~ '72071',
+    (Site_State_Abbreviation == 'AK' & Complete_County_Name == "Wrangell City and Borough") ~ '02275',
+    (Site_State_Abbreviation == 'AK' & Complete_County_Name == "Anchorage Borough") ~ '02020',
+    (Site_State_Abbreviation == 'NM' & Complete_County_Name == "Not Determined") ~ '35049',
+    (Site_State_Abbreviation == 'OK' & Complete_County_Name == "Not Determined") ~ '40109',
+    (Site_State_Abbreviation == 'IN' & Complete_County_Name == "La Porte County") ~ '18091',
+    (Site_State_Abbreviation == 'IL' & Complete_County_Name == "La Salle County") ~ '17099',
+    TRUE ~ fips_code
+  ))
+
+```
+
+
+### Add Geocoded Site Coordinates
+```{r}
+# Initialize an empty data frame
+geocode_results_all <- data.frame()
+
+# Populate with geocoding results
+for (i in list.files(file.path('data/geocode_results'))){
+  geocode_results_all <- rbind(geocode_results_all, read.csv(file.path('data/geocode_results', i)))
+}
+
+geocode_results_all <- geocode_results_all %>%
+  select(ObjectId, geocode_lat, geocode_lon, accept_coords) %>% # Only care about these columns
+  distinct() # Remove the one duplicate row
+
+# Join results with original data
+all_sites <- all_sites %>%
+  left_join(geocode_results_all, by = 'ObjectId') %>% # Join based on ObjectId
+  mutate(site_lat = case_when(accept_coords == TRUE ~ geocode_lat, # Accept new coords
+                              accept_coords == FALSE | is.na(accept_coords) ~ site_lat), # Reject new coords
+         site_lon = case_when(accept_coords == TRUE ~ geocode_lon,
+                              accept_coords == FALSE | is.na(accept_coords) ~ site_lon)) %>%
+  select(-geocode_lat, -geocode_lon, -accept_coords) # Remove unnecessary columns
+
+
+```
+
+
+### Add SolarAPI Results
+```{r}
+# Initialize an empty data frame
+solarapi_results_all <- data.frame()
+
+# Populate with solarapi results
+for (i in list.files(file.path('data/solarapi_results'))){
+  solarapi_results_all <- rbind(solarapi_results_all, read.csv(file.path('data/solarapi_results', i)))
+}
+
+# REVISIT THE NAMING CONVENTIONS HERE
+solarapi_results_all <- solarapi_results_all %>%
+  select(ObjectId, roof_area_sqm, usable_roof_area_sqm, aurora_panel_count,
+         aurora_nameplate_capacity, aurora_annual_solar_generation_kwh, 
+         num_roof_segments, building_height_sealevel) %>% # Only care about these columns
+  rename(solarapi_panel_count = aurora_panel_count,
+         solarapi_nameplate_capacity = aurora_nameplate_capacity,
+         solarapi_annual_solar_generation_kwh = aurora_annual_solar_generation_kwh)
+
+
+# Join results with original data
+all_sites <- all_sites %>%
+  left_join(solarapi_results_all, by = 'ObjectId')
+
+```
+
+
+### Add Tax Incentive Qualification
+```{r}
+# Read in the two shapefiles of interest to intersect with
+# Both of these files share the same CRS
+msa_areas <- st_read('data/Shapefiles/2024_msa.shp')
+coal_closures <- st_read('data/Shapefiles/coal_closure.shp')
+
+# Convert the FQHC site coordinates to a geometry/feature and adjust CRS to match with the shapefiles above
+site_coords <- st_as_sf(all_sites, coords = c('site_lon', 'site_lat'), crs = 4326) %>%
+  st_transform(crs = st_crs(msa_areas))
+
+# Create logical columns indicating whether the site intersects each layer
+site_coords$in_coal_closure <- lengths(st_intersects(site_coords, coal_closures)) > 0
+site_coords$in_msa_area <- lengths(st_intersects(site_coords, msa_areas)) > 0
+
+# Create column that combines the last two and tells us T/F whether the site qualifies for extra incentive
+site_coords$energy_community <- site_coords$in_coal_closure | site_coords$in_msa_area
+
+# Format results before exporting
+tax_incentive_classification <- site_coords %>%
+  select(ObjectId, energy_community) %>%
+  st_drop_geometry()
+
+all_sites <- all_sites %>%
+  left_join(tax_incentive_classification, by = 'ObjectId')
+
+```
+
+
+### Add Health Equity
+```{r}
+# Read in health equity data
+health_equity <- read.csv('data/raw/Health_equity.csv') %>%
+  mutate(county_code = sprintf("%05d", county_code)) %>% # Format fips code appropriately
+  rename(fips_code = county_code,
+         health_aggregate_percentile = total_percentile) %>%
+  select(-total)
+
+all_sites <- all_sites %>%
+  left_join(health_equity, by = 'fips_code')
+
+```
+
+
+### Add Power Outage Risk
+```{r}
+
+# Draw the most recent power outage data for joining the results with clinic data
+power_outage_summary <- read.csv(here('code/data/outage_results/outages_by_county_master.csv')) %>%
+  group_by(fips_code) %>%
+  slice_max(order_by = year, n = 1) %>% # Selects the most recent available data for each county
+  ungroup() %>%
+  filter(year >= 2019) %>% # Set the lower limit of data we're willing to accept, earlier years had poor coverage
+  select(fips_code, saidi, total_customers)
+
+long_outage_count <- read.csv(here('code/data/outage_results/outage_summaries_2023.csv')) %>%
+  filter(total_duration_minutes >= 240) %>% # Filter for outages longer than 4 hours
+  group_by(fips_code) %>%
+  summarize(customers_impacted = sum(total_customers_impacted)) %>% # Calculates number of customers experiencing these long outages
+  ungroup()
+
+relevant_outage_info <- power_outage_summary %>%
+  left_join(long_outage_count, by = 'fips_code') %>%
+  mutate(long_outage_expectation = customers_impacted / total_customers, # Calculates the frequency at which the average customer would experience long outages annually
+         fips_code = sprintf("%05d", fips_code)) %>% # Formatting
+  select(-customers_impacted, -total_customers)
+
+all_sites <- all_sites %>%
+  left_join(relevant_outage_info, by = 'fips_code')
+
+```
+
+
+### Add Rural Community DOE Distinction
+```{r, warning=FALSE, message=FALSE}
+
+# Get your own API key here: https://api.census.gov/data/key_signup.html
+census_api_key('f5b1d1d3e085a5f678d6fe7723ece747f9e4b9f5', install = TRUE, overwrite = TRUE)
+
+# UPDATE this with the location of your data
+data_path <- 'data/raw'
+
+# Downloaded from Census under 'Datasets' tab https://www.census.gov/data/tables/time-series/demo/popest/2020s-total-cities-and-towns.html
+city_pop <- read.csv(file.path(data_path, 'sub-est2023.csv'))
+
+# Downloaded from Census https://data.census.gov/table?q=Annual%20Estimates%20of%20the%20Resident%20Population&g=010XX00US$1600000
+places_pop <- read.csv(file.path(data_path, 'DECENNIALDP2020.DP1-Data.csv'))
+
+# Downloaded from SimpleMaps https://simplemaps.com/data/us-neighborhoods
+neighborhood_link <- read.csv(file.path(data_path, 'usneighborhoods.csv'))
+
+# Data Processing
+places_pop_clean <- places_pop %>%
+  select(GEO_ID, NAME, DP1_0001C) %>%
+  mutate(DP1_0001C = as.numeric(DP1_0001C)) %>% # Make population column numeric
+  filter(!str_detect(NAME, '(pt.)'), # Removes partial city data
+         !str_detect(NAME, 'township')) %>% # Removes townships that overlap with cities
+  separate(NAME, into = c("Site_City", "State_Name"), sep = ", ", extra = "merge", fill = "right") %>%
+  mutate(Site_City = stri_replace_all_regex(stri_trans_nfd(Site_City), "\\p{Mn}", ""), # Removes special characters from PR cities
+         Site_City = str_replace(Site_City, ' city.*', ''), # Remove unnecessary name endings
+         Site_City = str_replace(Site_City, ' town.*', ''),
+         Site_City = str_replace(Site_City, ' village.*', ''),
+         Site_City = str_replace(Site_City, ' borough.*', ''),
+         Site_City = str_replace(Site_City, ' County.*', ''),
+         Site_City = str_replace(Site_City, ' municipality.*', ''),
+         Site_City = str_replace(Site_City, 'St\\.', 'Saint'),
+         Site_City = str_replace(Site_City, ' CDP.*', ''),
+         Site_City = str_replace(Site_City, "'", ""), # Remove apostrophes
+         Site_City = str_replace(Site_City, ' zona urbana', ''),
+         Site_City = str_replace(Site_City, ' comunidad', ''),
+         Site_City = ifelse(State_Name %in% c('Georgia', 'Kentucky', 'North Carolina', 
+                                              'Montana', 'Tennessee'), 
+                            str_replace(Site_City, '-.*', ''), Site_City), # Remove extra long endings after hyphens
+         
+         Site_City = str_replace(Site_City, 'Coeur dAlene', 'coeur d alene'), # Specific instance in Idaho
+         Site_City = str_replace(Site_City, 'El Paso de.*', 'paso robles'), # Specific instance in California
+         Site_City = tolower(Site_City)) %>%
+  select(Site_City, State_Name, Population = DP1_0001C) %>% # Take specific columns and rename population
+  group_by(Site_City, State_Name) %>%
+  summarize(across(c(Population), max)) %>% # Simplify results if there are duplicates, taking the max population
+  ungroup()
+
+city_pop_clean <- city_pop %>%
+  filter(FUNCSTAT %in% c('A', 'B', 'C'), # Ensures we only get active cities
+         !str_detect(NAME, '(pt.)'), # Removes partial city data
+         !str_detect(NAME, 'township')) %>% # Removes townships that overlap with cities
+  select(Site_City = NAME, State_Name = STNAME, Population = ESTIMATESBASE2020) %>%
+  mutate(Site_City = stri_replace_all_regex(stri_trans_nfd(Site_City), "\\p{Mn}", ""), # Removes special characters from PR cities
+         Site_City = str_replace(Site_City, ' city.*', ''), # Remove unnecessary name endings
+         Site_City = str_replace(Site_City, ' town.*', ''),
+         Site_City = str_replace(Site_City, ' village.*', ''),
+         Site_City = str_replace(Site_City, ' borough.*', ''),
+         Site_City = str_replace(Site_City, ' County.*', ''),
+         Site_City = str_replace(Site_City, ' municipality.*', ''),
+         Site_City = str_replace(Site_City, 'St\\.', 'Saint'),
+         Site_City = str_replace(Site_City, "'", ""), # Remove apostrophes
+         Site_City = str_replace(Site_City, ' zona urbana', ''),
+         Site_City = str_replace(Site_City, ' comunidad', ''),
+         Site_City = ifelse(State_Name %in% c('Georgia', 'Kentucky', 'North Carolina', 
+                                              'Montana', 'Tennessee'), 
+                            str_replace(Site_City, '-.*', ''), Site_City),
+         Site_City = str_replace(Site_City, "Coeur dAlene", "coeur d alene"), # Specific instance in Idaho
+         Site_City = str_replace(Site_City, "El Paso de.*", "paso robles"), # Specific instance in California
+         Site_City = tolower(Site_City)) %>% # Join above observations
+  group_by(Site_City, State_Name) %>%
+  summarize(across(c(Population), max)) %>% # Simplify results if there are duplicates
+  ungroup()
+
+all_sites_pop <- all_sites %>%
+  mutate(Site_City = tolower(Site_City), # Make names lowercase to match
+         Site_City = str_replace(Site_City, 'mc ', 'mc')) # Update so all places with 'mc' are updated to match
+
+all_sites_population_new <- left_join(all_sites_pop, places_pop_clean, by = c('State_Name', 'Site_City')) %>% # Join data by state and city
+  select(Site_City, State_Name, Population, ObjectId, site_lat, site_lon) %>%
+  left_join(city_pop_clean, by = c('State_Name', 'Site_City')) %>% # Join secondary data set by state and city
+  mutate(Population.x = ifelse(!is.na(Population.y), Population.y, Population.x)) %>% # Update empty population entries with new values 
+  select(Site_City, State_Name, Population = Population.x, ObjectId, site_lat, site_lon) # Remove unnecessary columns
+
+all_sites_pop_missing <-  all_sites_population_new[is.na(all_sites_population_new[['Population']]), ] %>% # Filter for missing populations
+  mutate(location_full = paste(Site_City, ', ', State_Name, sep = '')) # Create new variable for easy manual searching
+
+neighborhood_link_clean <- neighborhood_link %>%
+  select(Site_City = neighborhood, State_Name = state_name, Updated_City = city_name) %>% # Rename columns
+  mutate(Site_City = tolower(Site_City), # Make column entries lowercase so they'll match up with other data
+         Updated_City = tolower(Updated_City))
+
+updated_locations <- left_join(all_sites_pop_missing, neighborhood_link_clean, by = c('State_Name', 'Site_City')) # Connect some missing sites to cities
+
+all_sites_population_new <- all_sites_population_new %>%
+  left_join(updated_locations, by = c('ObjectId')) %>% # Use ObjectId to link updated locations
+  mutate(Site_City.x = ifelse(!is.na(Updated_City), Updated_City, Site_City.x)) %>% # Updated site city locations with new finds
+  select(Site_City = Site_City.x, State_Name = State_Name.x, ObjectId, site_lat = site_lat.x, site_lon = site_lon.x) %>% # Rename columns
+  left_join(places_pop_clean, by = c('State_Name', 'Site_City')) %>% # Join data by state and city
+  select(Site_City, State_Name, Population, ObjectId, site_lat, site_lon) %>%
+  left_join(city_pop_clean, by = c('State_Name', 'Site_City')) %>% # Join secondary data set by state and city
+  mutate(Population.x = ifelse(!is.na(Population.y), Population.y, Population.x)) %>% # Update empty population entries with new values 
+  select(Site_City, State_Name, Population = Population.x, ObjectId, site_lat, site_lon) # Remove unnecessary columns
+
+# Create a subset of remaining missing sites
+missing_locs <- all_sites_population_new[is.na(all_sites_population_new$Population), ] 
+
+# Create spatial object with site coordinates
+coords_sf <- st_as_sf(missing_locs, coords = c("site_lon", "site_lat"), crs = 4326) 
+
+# Make a list of all 50 states, D.C., and Puerto Rico
+states <- unique(fips_codes$state)[1:55] 
+
+
+states_fips <- c(
+  "01", "02", "04", "05", "06", "08", "09", "10", "11", "12", "13", "15", "16", "17", "18", "19", "20", "21", "22", "23", 
+  "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "44", 
+  "45", "46", "47", "48", "49", "50", "51", "53", "54", "55", "56", "72"  # Puerto Rico's FIPS code is "72"
+)
+
+# Define the path where the shapefiles are stored locally
+shapefile_directory <- here('code/data/tigerline') # Change this to your local directory
+
+# Function to read shapefiles for each state
+read_state_tracts <- function(fips_code) {
+  shapefile_path <- file.path(shapefile_directory, paste0('tl_2020_', fips_code, '_tract'), paste0('tl_2020_', fips_code, '_tract.shp'))
+  
+  # Check if the file exists before attempting to read it
+  if (file.exists(shapefile_path)) {
+    return(st_read(shapefile_path))
+  } else {
+    message('Shapefile for state FIPS code ', fips_code, ' not found')
+    return(NULL)
+  }
+}
+
+# Read and store tracts for all states, DC, and Puerto Rico
+all_tracts <- lapply(states_fips, read_state_tracts)
+
+# Combine all the individual state data into one large sf object (if any state data was successfully loaded)
+all_tracts_sf <- do.call(rbind, all_tracts) %>%
+  st_transform(all_tracts, crs = 4326)
+
+
+# Spatial join coordinates with tracts to get the GEOID
+coords_with_geoid <- st_join(coords_sf, all_tracts_sf, join = st_intersects) %>% distinct() 
+
+# Get population data for each unique GEOID through the Census American Community Survey
+population_data <- map_dfr(unique(coords_with_geoid$GEOID), 
+                           ~get_acs(geography = "tract", 
+                                    variables = "B01003_001", 
+                                    year = 2020, 
+                                    state = substr(.x, 1, 2), 
+                                    tract = substr(.x, 3, 11)))
+
+# Join the population data back to original coordinates
+missing_locs_found <- coords_with_geoid %>%
+  st_drop_geometry() %>% # Not needed anymore
+  left_join(population_data, by = "GEOID") %>% # Link sites to population values
+  distinct() %>% # Remove duplicates if they occur
+  select(ObjectId, estimate)
+
+# Add newly found values to ongoing data
+final_pop_results <- all_sites_population_new %>%
+  left_join(missing_locs_found, by = c('ObjectId')) %>%
+  mutate(Population = ifelse(!is.na(estimate), estimate, Population)) %>% # Update formerly missing populations
+  select(-estimate) %>% # Remove unnecessary column
+  mutate(rural_indicator = Population < 10000, # Create indicator column
+         community_rural_doe = case_when(rural_indicator == TRUE ~ 'Yes',
+                                         rural_indicator == FALSE ~ 'No')) %>%
+  select(ObjectId, site_city_population_2020 = Population, community_rural_doe) # Remove unwanted columns
+
+# Combine finalized data
+all_sites <- all_sites %>%
+  left_join(final_pop_results, by = 'ObjectId') # Join finalized population data
+
+```
+
+
+### Add MUA Classification
+```{r}
+mua_designation <- read.csv(here('code/data/mua_designation.csv')) %>%
+  mutate(fips_code = sprintf("%05d", fips_code))
+
+all_sites <- all_sites %>%
+  left_join(mua_designation, by = 'fips_code') %>%
+  mutate(mua = case_when(mua == TRUE ~ TRUE, # Keeps original data the same
+                         TRUE ~ FALSE)) # Assigns FALSE to counties that didn't match
+
+```
+
+
+### Add Utility Rate by State
+```{r}
+utility_rate <- read.csv(here('code/data/raw/state_utility_rate.csv')) %>%
+  rename('State_Name' = 'X')
+
+all_sites <- all_sites %>%
+  left_join(utility_rate, by = 'State_Name') %>%
+  mutate(utility_rate = replace_na(utility_rate, 20),
+         utility_rate = round(utility_rate/100, digits = 2)) # Standard rate for non-recorded regions like PR
+```
+
+
+### Final Step: Financial Calculations and ZScores
+```{r}
+
+# Perform calculations on static clinic_data
+all_sites <- all_sites %>%
+  rowwise() %>%
+  mutate( # Create default values for financial fields of interest
+    roof_area_sqft = roof_area_sqm * 10.7639, # Standard conversion
+    annual_energy_consumption_kwh = roof_area_sqft * 12, # Uses 12 kWh/sqft per year for energy consumption
+    monthly_energy_consumption_kwh = annual_energy_consumption_kwh / 12,
+    peak_power_use_kw = annual_energy_consumption_kwh / 2750, # This factor is based on the mean of about 35 screening sites
+    solar_system_cost = (solarapi_nameplate_capacity * 1000 * 3), # Calculate how much the system would cost before CE's fee and incentives at a rate of $3 per Watt
+    solar_install_cost = (solar_system_cost * (1 - (0.3 + 0.1 * energy_community))) + solar_system_cost * 0.12, # Accounts for CE's fee and incentives
+    vaccine_value = roof_area_sqft * 20,  # Assumed that there's $20 worth of refrigerated value per sqft
+    patients_seen_hourly = (roof_area_sqft * 3) / 1000, # Assumed that there's roughly 3 patients per 1000 sqft per hour
+    annual_solar_savings = solarapi_annual_solar_generation_kwh * utility_rate,
+    lifetime_solar_savings = map_dbl(annual_solar_savings, ~ round(sum(.x / (1.05^(1:25))), 0)), # Calculates present value with the indexed interest rate
+    lifetime_solar_maintenance_costs = map_dbl(solarapi_nameplate_capacity, ~ round(sum((.x * 50) / (1.05^(1:25))), 0)), # Calculates present value with the indexed interest rate
+    net_present_value_solar = lifetime_solar_savings - solar_install_cost - lifetime_solar_maintenance_costs,
+    battery_size_kwh = peak_power_use_kw * 8, # Capacity is set as 8 hours of their peak usage
+    battery_system_cost = (battery_size_kwh * 1100 + peak_power_use_kw * 3220), # Cost for just the battery system, pre-install
+    battery_install_cost = battery_system_cost * (1 - 0.3 - 0.1 * energy_community) + battery_system_cost * 0.12, # Total cost, including incentives and CE's fee
+    lifetime_battery_savings = map2_dbl(patients_seen_hourly, vaccine_value, ~ round(sum((.x * saidi / 60 * 311 + long_outage_expectation * .y) / (1.05^(1:15))), 0)), # Present value is calculated over a lifetime of 15 years, and the assumed revenue per patient visit is $311, an average from Capital Link
+    lifetime_battery_maintenance = map_dbl(battery_size_kwh, ~ round(sum((.x * 10) / (1.05^(1:15))), 0)), # Assumed maintenance of $10/kWh each year
+    net_present_value_battery = lifetime_battery_savings - battery_install_cost - lifetime_battery_maintenance) %>%
+  ungroup() %>% # Stop rowwise operations
+  mutate(
+    # Calculate zscores for non-monetary variables
+    zscore_avg_baseline_health = as.numeric(scale(avg_baseline_health)),
+    zscore_avg_baseline_environment = as.numeric(scale(avg_baseline_environment)),
+    zscore_avg_climate_change_health = as.numeric(scale(avg_climate_change_health)),
+    zscore_mdi_percentile = as.numeric(scale(mdi_percentile)),
+    zscore_fema_nri = as.numeric(scale(FEMA_NRI_Risk_Score)),
+    community_rural_doe = (community_rural_doe == 'Yes'), # Convert to TRUE/FALSE
+    zscore_rural = as.numeric(scale(community_rural_doe)),
+    zscore_mua = as.numeric(scale(mua))
+    )
+
+# Calculate zscores for SAIDI to represent outage risk; needs to be done externally so it's not impacted by frequency of sites in certain counties
+zscore_saidi <- read.csv(here('code/data/outage_results/outages_by_county_master.csv')) %>%
+  mutate(fips_code = sprintf("%05d", fips_code)) %>%
+  group_by(fips_code) %>%
+  slice_max(order_by = year, n = 1) %>% # Selects the most recent available data for each county
+  ungroup() %>%
+  filter(year >= 2019) %>% # Set the lower limit of data we're willing to accept, earlier years had poor coverage
+  drop_na() %>% # One row was coming in as NA likely due to a missing value for MCC (modeled customer count)
+  mutate(zscore_saidi = as.numeric(scale(saidi))) %>% # Calculate zscore based on the values present
+  select(fips_code, zscore_saidi) # Select only the column of interest and the join column
+
+# Join newly calculated zscore for SAIDI
+all_sites <- all_sites %>%
+  left_join(zscore_saidi, by = 'fips_code')
+
+# Add a column that CE can use to exclude sites from analysis in the tool
+all_sites <- all_sites %>%
+  mutate(exclude_site = FALSE)
+
+# Write final outputs
+write.csv(all_sites, here('code/data/finalized_dashboard_data.csv'), row.names = FALSE)
+
+```
+

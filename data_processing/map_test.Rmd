@@ -1,0 +1,39 @@
+---
+title: "Test"
+author: "Henry Strecker"
+date: "2025-01-18"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load necessary libraries
+library(sf)
+library(ggplot2)
+
+# Read the shapefile
+shapefile <- st_read("C:/Users/Hank1/Documents/Collective Energy/code/data/Shapefiles/2024_msa.shp")
+
+# Plot the shapefile on a US map
+ggplot(data = shapefile) +
+  geom_sf()
+
+```
+
+
+```{r}
+
+# Read the shapefile
+shapefile <- st_read("C:/Users/Hank1/Documents/Collective Energy/code/data/Shapefiles/coal_closure.shp")
+
+# Plot the shapefile on a US map
+ggplot(data = shapefile) +
+  geom_sf() +
+  theme_minimal()
+
+
+```
+

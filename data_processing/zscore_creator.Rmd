@@ -1,0 +1,87 @@
+---
+title: "Z-Score calculations"
+author: "Henry Strecker"
+date: "2025-03-15"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(readxl)
+library(here)
+```
+
+
+```{r}
+# Draw the most recent power outage data for joining the results with clinic data
+power_outage_summary <- read.csv(here('code/data/outage_results/outages_by_county_master.csv')) %>%
+  filter(year == 2023) %>%
+  select(fips_code, saidi, total_customers)
+
+# Calculate zscores for SAIDI to represent outage risk; to be joined with the data later
+saidi_zscore <- read.csv(here('code/data/outage_results/outages_by_county_master.csv')) %>%
+  group_by(fips_code) %>%
+  slice_max(order_by = year, n = 1) %>% # Selects the most recent available data for each county
+  ungroup() %>%
+  filter(year >= 2019) %>% # Set the lower limit of data we'r ewilling to accept, earlier years had poor coverage
+  drop_na() %>% # One row was coming in as NA likley due to a missing value for MCC (modeled customer count)
+  mutate(zscore_saidi = as.numeric(scale(saidi))) %>% # Calculate zscore based on the values present
+  select(fips_code, zscore_saidi) # Select only the column of interest and the join column
+
+long_outage_count <- read.csv(here('code/data/outage_results/outage_summaries_2023.csv')) %>%
+  filter(total_duration_minutes >= 240) %>% # Filter for outages longer than 4 hours
+  group_by(fips_code) %>%
+  summarize(customers_impacted = sum(total_customers_impacted)) %>% # Calculates number of customers experiencing these long outages
+  ungroup()
+
+relevant_outage_info <- power_outage_summary %>%
+  left_join(long_outage_count, by = 'fips_code') %>%
+  mutate(long_outage_expectation = customers_impacted / total_customers) %>% # Calculates the frequency at which the average customer would experience long outages annually
+  select(-customers_impacted, -total_customers)
+
+data_input <- read.csv(here('code/data/data_layers_mar1.csv')) %>%
+  left_join(relevant_outage_info, by = 'fips_code')
+
+
+# Perform calculations on static clinic_data
+dashboard_input <- data_input %>%
+  rowwise() %>%
+  mutate( # Create default values for financial fields of interest
+    utility_rate = 0.2, # Default
+    roof_area_sqft = roof_area_sqm * 10.7639, # Standard conversion
+    annual_energy_consumption_kwh = roof_area_sqft * 12, # Uses 12 kwh/sqft per year for energy consumption
+    monthly_energy_consumption_kwh = annual_energy_consumption_kwh / 12,
+    peak_power_use_kw = annual_energy_consumption_kwh / 2750, # This factor is based on the mean of about 35 screening sites
+    solar_install_cost = (solarapi_nameplate_capacity * 1000 * 3) * (1 - (0.3 + 0.1 * qualifies)), # Takes into account tax incentives
+    vaccine_value = roof_area_sqft * 20,  # Assumed that there's $20 worth of refrigerated value per sqft
+    patients_seen_hourly = (roof_area_sqft * 3) / 1000, # Assumed that there's roughly 3 patients per 1000 sqft per hour
+    annual_solar_savings = solarapi_annual_solar_generation_kwh * utility_rate,
+    lifetime_solar_savings = map_dbl(annual_solar_savings, ~ round(sum(.x / (1.05^(1:25))), 0)), # Calculates present value with the indexed interest rate
+    lifetime_solar_maintenance_costs = map_dbl(solarapi_nameplate_capacity, ~ round(sum((.x * 50) / (1.05^(1:25))), 0)), # Calculates present value with the indexed interest rate
+    net_present_value_solar = lifetime_solar_savings - solar_install_cost - lifetime_solar_maintenance_costs,
+    battery_size_kwh = peak_power_use_kw * 8, # Capacity is set as 8 hours of their peak usage
+    battery_install_cost = (battery_size_kwh * 1100 + peak_power_use_kw * 3220) * (1 - 0.3 - 0.1 * qualifies),
+    lifetime_battery_savings = map2_dbl(patients_seen_hourly, vaccine_value, ~ round(sum((.x * saidi / 60 * 311 + long_outage_expectation * .y) / (1.05^(1:15))), 0)), # Present value is calculated over a lifetime of 15 years, and the assumed revenue per patient visit is $311, an average from Capital Link
+    lifetime_battery_maintenance = map_dbl(battery_size_kwh, ~ round(sum((.x * 10) / (1.05^(1:15))), 0)), # Assumed maintenance of $10/KwH each year
+    net_present_value_battery = lifetime_battery_savings - battery_install_cost - lifetime_battery_maintenance) %>%
+  ungroup() %>% # Stop rowwise operations
+  mutate(
+    # Calculate zscores for non-monetary variables
+    zscore_avg_baseline_health = as.numeric(scale(avg_baseline_health)),
+    zscore_avg_baseline_environment = as.numeric(scale(avg_baseline_environment)),
+    zscore_avg_climate_change_health = as.numeric(scale(avg_climate_change_health)),
+    zscore_mdi_percentile = as.numeric(scale(mdi_percentile)),
+    zscore_toxpi = as.numeric(scale(ToxPi_Score)),
+    zscore_fema_nri = as.numeric(scale(FEMA_NRI_Risk_Score)),
+    community_rural_doe = (community_rural_doe == 'Yes'),
+    zscore_rural = as.numeric(scale(community_rural_doe))
+    ) %>%
+  left_join(saidi_zscore, by = 'fips_code')
+
+# Write final outputs
+write.csv(dashboard_input, here('code/data/finalized_dashboard_data.csv'), row.names = FALSE)
+
+```
+

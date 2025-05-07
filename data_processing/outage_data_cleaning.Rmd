@@ -1,0 +1,369 @@
+---
+title: "ORNL Outage Data Processing"
+date: "August 2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(here)
+options(scipen = 999)
+
+```
+
+System Average Interruption Duration Index (SAIDI) is a measure of service reliability, and it is measured as
+$$ SAIDI = \frac{\sum_{i=1}^{n}{U_i*N_i}}{N_t} $$
+where $U_i$ is the duration of utility interruption for each of the n interruptions experienced, $N_i$ is the number of customers impacted for each of the n interruptions experienced, and $N_t$ is the total number of customers provided. It can be interpreted as the average amount of time a customer can expect to experience outage in a given time period.
+
+System Average Interruption Frequency Index (SAIFI) is a measure of the frequency of outages, measured as
+$$ SAIFI = \frac{\sum_{i=1}^{n}{N_i}}{N_t}$$
+where $N_i$ is the number of customers impacted for each of the n interruptions experienced, and $N_t$ is the total number of customers provided by the utility. It can be interpreted as the average number of times a customer can expect to experience a power outage in a given time period.
+
+For the purposes of the data present, we will be calculating SAIDI and SAIFI in the context of each US county, with results summarizing entire years. Therefore the results will represent the average amount of time and number of outages a customer should expect to experience in that county across an entire year.
+
+
+
+Set file paths to access input data and write output data and define the Eaglei data processing function
+
+```{r}
+# Define the file paths for raw data and where to write output
+outage_data_path <- 'data/outage_raw'
+results_path <-  'data/outage_results'
+
+# Create a function that can process a full years worth of data
+outage_processing <- function(input_loc, output_loc, filename){
+  
+  raw_data <- read.csv(file.path(input_loc, filename))
+  # Rename a column - only needed for 2023 data
+  if (grepl('2023', i)){
+    raw_data <- raw_data %>%
+      rename(customers_out = sum)
+  }
+  
+  outage <- raw_data %>%
+    filter(!customers_out == 0) %>% # Remove zero customer outages
+    mutate(run_start_time = ymd_hms(run_start_time)) %>% # Convert column to be numeric time
+    group_by(fips_code) %>%
+    arrange(fips_code, run_start_time) %>% # Sort by fips and start time to get rows in order
+    mutate(
+      time_diff = difftime(run_start_time, lag(run_start_time, default = first(run_start_time)), units = "mins"), # Record time lag between entries
+      customer_change = customers_out != lag(customers_out, default = first(customers_out)), # Indicate if number of customers has changed since last entry
+      new_event = (time_diff > 15 | customer_change | fips_code != lag(fips_code, default = first(fips_code))), # Indicate if a new event has begun based on other columns
+      event_id = cumsum(new_event) + 1) %>% # Create unique identification for each outage event
+    group_by(fips_code, event_id) %>% # Begin summarizing for each event
+    summarize(
+      event_start_time = first(run_start_time), # Record the start time for each event
+      event_end_time = last(run_start_time), # Record the end time for each event
+      total_customers_impacted = first(customers_out), # Record number of customers impacted
+      total_duration_minutes = as.numeric(difftime(event_end_time, event_start_time, units = "mins")) + 15, # Calculate total length of the outage, add 15 minutes for uniform uncertainty
+      customer_minutes = total_customers_impacted * total_duration_minutes, # Calculate customer-minutes
+      .groups = 'drop') %>% # Ensures the result is ungrouped
+    group_by(fips_code) %>% # Begin summarizing all events in each fips code
+    summarize(
+      total_outages = n(), # Total number of outages
+      total_customers_affected = sum(total_customers_impacted), # Total number of customer impacted by outages
+      total_customer_minutes = sum(customer_minutes)) %>% # Total number of outage customer-minutes
+    mutate(year = as.numeric(substr(filename, 16, 19))) %>%
+    select(fips_code, year, total_outages, total_customers_affected, total_customer_minutes)
+  
+  write.csv(outage, file.path(output_loc, paste0('outage_by_county_', substr(filename, 16, 19), '.csv')), row.names = FALSE)
+  cat('Processing has finished for year ', substr(filename, 16, 19), '\n', sep = '')
+  
+  return(outage)
+}
+
+
+```
+
+
+
+Performing data processing for all Eaglei data. 
+On my machine, this took roughly 5 and a half hours to get through all 8GB
+
+```{r}
+
+for (i in list.files(file.path(here('code'), outage_data_path))){
+  # There's nothing to calculate for MCC
+  if (i == 'MCC.csv'){next}
+  
+  # Carry out the function defined above for each year of data
+  outage_by_county <- outage_processing(input_loc = outage_data_path, output_loc = results_path, filename = i)
+}
+
+```
+
+
+Properly process and update Modeled County Customer (MCC) data
+
+```{r}
+# Read initial form of the MCC data
+mcc <- read.csv(file.path(outage_data_path, 'MCC.csv')) %>%
+  select(fips_code = County_FIPS, total_customers = Customers) %>%
+  filter(fips_code != 'Grand Total') %>%
+  mutate(fips_code = as.numeric(fips_code))
+
+# Cycle through outage data and update when a single outage is greater than the original MCC
+for (i in list.files(file.path(here('code'), outage_data_path))){
+  
+  # There's nothing to calculate for MCC
+  if (i == 'MCC.csv'){next}
+  
+  if (grepl('2023', i)){
+    check_mcc <- read.csv(file.path(outage_data_path, i)) %>%
+      rename(customers_out = sum) # Special case column rename
+  } else {
+    check_mcc <- read.csv(file.path(outage_data_path, i))
+  }
+  
+  # Extract number of affected customers in each county's largest outage
+  check_mcc <- check_mcc %>%
+    group_by(fips_code) %>%
+    summarize(customers = max(customers_out),
+              .groups = 'drop') %>%
+    ungroup()
+  
+  # Update MCC data if a single outage has a greater value than was existing
+  mcc <- mcc %>%
+    left_join(check_mcc, by = 'fips_code') %>%
+    mutate(total_customers = pmax(total_customers, customers, na.rm = TRUE)) %>%
+    select(-customers)
+}
+
+write.csv(mcc, file.path(results_path, 'mcc_updated.csv'), row.names = FALSE)
+
+
+```
+
+
+
+Combine each year of summarized outage data into a master file
+
+```{r}
+
+all_county_results <- c("data/outage_results/outage_by_county_2014.csv", "data/outage_results/outage_by_county_2015.csv", "data/outage_results/outage_by_county_2016.csv", "data/outage_results/outage_by_county_2017.csv", "data/outage_results/outage_by_county_2018.csv", "data/outage_results/outage_by_county_2019.csv", "data/outage_results/outage_by_county_2020.csv", "data/outage_results/outage_by_county_2021.csv", "data/outage_results/outage_by_county_2022.csv", "data/outage_results/outage_by_county_2023.csv")
+
+mcc <- read.csv(file.path(results_path, 'mcc_updated.csv'))
+
+final_outage_results <- do.call(rbind, lapply(all_county_results, read.csv)) %>%
+  left_join(mcc, by = 'fips_code') %>%
+  mutate(saidi = total_customer_minutes / total_customers,
+         saifi = total_customers_affected / total_customers)
+
+write.csv(final_outage_results, file.path(results_path, 'outages_by_county_master.csv'))
+
+```
+
+
+Process data up to the outage level so that we can get an understanding of outage time distribution
+The following code was only carried out on 2022 and 2023 data for concision
+
+```{r}
+
+# Create a function that can process a full years worth of data
+for (i in list.files(file.path(here('code'), outage_data_path))){
+  
+  if (grepl('2023', i)){
+    raw_data <- read.csv(file.path(outage_data_path, i)) %>%
+      select(fips_code, county, state, customers_out = sum, run_start_time)
+  } else if (grepl('2022', i)) {
+    raw_data <- read.csv(file.path(outage_data_path, i))
+  } else {next}
+  
+  outage <- raw_data %>%
+    filter(!customers_out == 0) %>% # Remove zero customer outages
+    mutate(run_start_time = ymd_hms(run_start_time)) %>% # Convert column to be numeric time
+    group_by(fips_code) %>%
+    arrange(fips_code, run_start_time) %>% # Sort by fips and start time to get rows in order
+    mutate(
+      time_diff = difftime(run_start_time, lag(run_start_time, default = first(run_start_time)), units = "mins"), # Record time lag between entries
+      customer_change = customers_out != lag(customers_out, default = first(customers_out)), # Indicate if number of customers has changed since last entry
+      new_event = (time_diff > 15 | customer_change | fips_code != lag(fips_code, default = first(fips_code))), # Indicate if a new event has begun based on other columns
+      event_id = cumsum(new_event) + 1) %>% # Create unique identification for each outage event
+    group_by(fips_code, event_id) %>% # Begin summarizing for each event
+    summarize(
+      event_start_time = first(run_start_time), # Record the start time for each event
+      event_end_time = last(run_start_time), # Record the end time for each event
+      total_customers_impacted = first(customers_out), # Record number of customers impacted
+      total_duration_minutes = as.numeric(difftime(event_end_time, event_start_time, units = "mins")) + 15, # Calculate total length of the outage, adjusted for uncertainty
+      customer_minutes = total_customers_impacted * total_duration_minutes, # Calculate customer-minutes
+      .groups = 'drop') # Ensures the result is ungrouped
+  
+  write.csv(outage, file.path(results_path, paste0('outage_summaries_', substr(i, 16, 19), '.csv')), row.names = FALSE)
+  cat('Processing has finished for year ', substr(i, 16, 19), '\n', sep = '')
+}
+
+```
+
+
+
+
+*********************************
+THE CODE BELOW IS NOT REQUIRED
+*********************************
+
+Assess coverage from the outage data to all FQHCs
+
+```{r, warning = FALSE}
+library(tidycensus)
+library(sf)
+library(tigris)
+
+final_outage_results <- read.csv(file.path(results_path, 'outages_by_county_master.csv'))
+
+fqhc <- read.csv('data/fqhc_site_august_14_2024.csv') %>% 
+  select(ObjectId, x, y)
+
+# Convert to spatial object
+coords_sf <- st_as_sf(fqhc, coords = c("x", "y"), crs = 4326)
+
+# Get county boundaries from tidycensus
+counties <- counties(cb = TRUE, class = "sf", year = 2020) %>%
+  st_transform(crs = 4326)
+
+# Join coordinates with county data to get FIPS codes
+coords_with_fips <- st_join(coords_sf, counties, join = st_intersects)
+
+fips_code_mapping <- coords_with_fips %>%
+  select(ObjectId, GEOID, NAME) %>%  # Select desired columns, including FIPS code (GEOID)
+  st_drop_geometry()
+
+fqhc <- read.csv('data/fqhc_site_august_14_2024.csv') %>%
+  left_join(select(fips_code_mapping, -NAME), by = 'ObjectId') %>%
+  rename(fips_code = GEOID) %>%
+  mutate(fips_code = as.numeric(fips_code))
+
+
+coverage_by_year <- final_outage_results %>%
+  group_by(year) %>%
+  summarise(
+    # Count how many FIPS codes from the list are in the dataframe for that year
+    covered_fips = sum(fqhc$fips_code %in% fips_code),
+    # Total FIPS codes in your list
+    total_fips_in_list = length(fqhc$fips_code),
+    # Calculate coverage percentage
+    coverage_percent = (covered_fips / total_fips_in_list) * 100
+  )
+
+# View the coverage by year
+print(coverage_by_year)
+
+
+missing_counties_2023 <- fqhc %>%
+  filter(!fips_code %in% (final_outage_results %>% filter(year == 2023) %>% pull(fips_code)))
+
+```
+
+Generate some exploratory plots
+
+```{r, fig.height = 6, fig.width = 12}
+annual_county_coverage <- final_outage_results %>%
+  group_by(year) %>%
+  summarize(counties_covered = n())
+
+county_coverage <- ggplot() +
+  geom_line(data = annual_county_coverage, aes(x = year, y = counties_covered), color = '#006099', linewidth = 1.1) +
+  labs(title = 'Number of Counties Present in Eaglei Outage Data (US Total: 3,143)',
+       x = 'Year',
+       y = 'Counties Covered') +
+  scale_x_continuous(breaks = seq(2014, 2023, by = 1)) + 
+  scale_y_continuous(breaks = seq(2000, 3200, by = 100))
+
+county_coverage
+
+ggsave(filename = 'data/figures/county_outage_coverage.jpg', plot = county_coverage, device = 'jpg', width = 8, height = 4, units = 'in', dpi = 300)
+
+```
+
+
+
+```{r, fig.height = 6, fig.width = 12}
+annual_metric_totals <- final_outage_results %>%
+  group_by(year) %>%
+  summarize(outages = sum(total_outages),
+            total_customers_affected = sum(total_customers_affected, na.rm = TRUE),
+            total_outages = sum(total_outages, na.rm = TRUE),
+            total_customer_minutes =sum(total_customer_minutes, na.rm = TRUE),
+            total_customers = sum(total_customers, na.rm = TRUE)) %>%
+  mutate(saidi = total_customer_minutes / total_customers,
+         saifi = total_customers_affected / total_customers)
+
+# Total outages by year
+annual_outages <- ggplot() +
+  geom_line(data = annual_metric_totals, aes(x = year, y = outages), color = '#006099', linewidth = 1.1) +
+  labs(title = 'Number of Outages per Year',
+       x = 'Year',
+       y = 'Annual Number of Observed Outages') +
+  scale_x_continuous(breaks = seq(2014, 2023, by = 1)) + 
+  scale_y_continuous(breaks = seq(0, 8000000, by = 1000000))
+
+annual_outages
+
+ggsave(filename = 'data/figures/annual_outages.jpg', plot = annual_outages, device = 'jpg', width = 6, height = 3, units = 'in', dpi = 300)
+
+
+# Average number of outages experienced by all US customers
+avg_annual_saifi <- ggplot() +
+  geom_line(data = annual_metric_totals, aes(x = year, y = saifi), color = '#006099', linewidth = 1.1) +
+  labs(title = 'Expectation of SAIFI for the Average US Consumer',
+       x = 'Year',
+       y = 'Annual SAIFI (Number of Outages)')
+
+avg_annual_saifi
+
+ggsave(filename = 'data/figures/avg_annual_saifi.jpg', plot = avg_annual_saifi, device = 'jpg', width = 12, height = 6, units = 'in', dpi = 300)
+
+# Annual average number of minutes of outage per US customer
+avg_annual_saidi <- ggplot() +
+  geom_line(data = annual_metric_totals, aes(x = year, y = saidi), color = '#006099', linewidth = 1.1) +
+  labs(title = 'Expectation of SAIDI for the Average US Consumer',
+       x = 'Year',
+       y = 'Annual SAIDI (minutes per year)')
+
+avg_annual_saidi
+
+ggsave(filename = 'data/figures/avg_annual_saidi.jpg', plot = avg_annual_saidi, device = 'jpg', width = 12, height = 6, units = 'in', dpi = 300)
+
+
+```
+
+
+
+```{r, fig.width = 12, fig.height = 6, warning = FALSE}
+all_outages_2022 <- read.csv('data/outage_results/outage_summaries_2022.csv')
+all_outages_2022$custom_bins <- cut(all_outages_2022$total_duration_minutes, breaks = c(0, 15, 30, 45, 60, 90, 120, 240, 480, 720, 1440, 2880))
+
+outage_hist_2022 <- ggplot() +
+  geom_histogram(data = all_outages_2022, aes(x = custom_bins), stat = 'count') + 
+  labs(title = 'Histogram of 2022 Outage Duration',
+       x = 'Minutes of Outage per Event',
+       y = 'Frequency') +
+  theme(axis.text.x = element_text(angle = 15),
+        title = element_text(size = 16))
+
+outage_hist_2022
+
+ggsave(filename = 'data/figures/outage_hist_2022.jpg', plot = outage_hist_2022, device = 'jpg', width = 12, height = 6, units = 'in', dpi = 300)
+
+
+
+all_outages_2023 <- read.csv('data/outage_results/outage_summaries_2023.csv')
+all_outages_2023$custom_bins <- cut(all_outages_2023$total_duration_minutes, breaks = c(0, 15, 30, 45, 60, 90, 120, 240, 480, 720, 1440, 2880))
+
+outage_hist_2023 <- ggplot() +
+  geom_histogram(data = all_outages_2023, aes(x = custom_bins), stat = 'count') + 
+  labs(title = 'Histogram of 2023 Outage Duration',
+       x = 'Minutes of Outage per Event',
+       y = 'Frequency') +
+  theme(axis.text.x = element_text(angle = 15),
+        title = element_text(size = 16))
+
+outage_hist_2023
+
+ggsave(filename = 'data/figures/outage_hist_2023.jpg', plot = outage_hist_2023, device = 'jpg', width = 12, height = 6, units = 'in', dpi = 300)
+
+```
+
+

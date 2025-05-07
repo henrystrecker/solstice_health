@@ -1,0 +1,164 @@
+---
+title: "Google SolarAPI Testing"
+author: "Henry Strecker"
+date: "2024-07-19"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(httr)
+library(jsonlite)
+library(tidyverse)
+library(readxl)
+```
+
+
+```{r}
+# Read in FQHC data to get coordinates
+fqhc <- read.csv('data/raw/fqhc_sites_july_30_2024.csv') %>% select(Site_Name, Site_Address, Site_City, Site_State_Abbreviation, ObjectId, x, y)
+
+api_key <- 'REDACTED'
+
+```
+
+
+```{r}
+# Define a function that will clearly output all of the information that we care about in our current analysis
+get_solar_api_results <- function(latitude, longitude, screening_panel_count, key){
+  # Call the API to get results for a given site
+  solar_api_test <- GET(paste0('https://solar.googleapis.com/v1/buildingInsights:findClosest?location.latitude=', latitude, 
+                               '&location.longitude=', longitude, '&requiredQuality=HIGH&key=', key))
+  
+  # Convert JSON to tabular format
+  test_data <- fromJSON(rawToChar(solar_api_test$content))
+  
+  # Check if the requiredQuality=HIGH parameter was met, if not run requiredQuality=MEDIUM
+  if (!is.null(test_data$error$message) && test_data$error$message == 'Requested entity was not found.'){
+    solar_api_test <- GET(paste0('https://solar.googleapis.com/v1/buildingInsights:findClosest?location.latitude=', latitude, 
+                                 '&location.longitude=', longitude, '&requiredQuality=MEDIUM&key=', key))
+  
+  # Convert JSON to tabular format
+  test_data <- fromJSON(rawToChar(solar_api_test$content))
+  }
+  
+  # Check if the requiredQuality=MEDIUM parameter was met, if not run requiredQuality=LOW
+  if (!is.null(test_data$error$message) && test_data$error$message == 'Requested entity was not found.'){
+    solar_api_test <- GET(paste0('https://solar.googleapis.com/v1/buildingInsights:findClosest?location.latitude=', latitude, 
+                                 '&location.longitude=', longitude, '&requiredQuality=LOW&key=', key))
+  
+  # Convert JSON to tabular format
+  test_data <- fromJSON(rawToChar(solar_api_test$content))
+  }
+  
+  # Maximum number of panels
+  max_panels <- as.numeric(test_data$solarPotential$maxArrayPanelsCount)
+  
+  # Total roof area in square feet
+  roof_area_sqft <- test_data$solarPotential$wholeRoofStats$areaMeters2 * 10.7639
+  
+  panels_generation <- test_data$solarPotential$solarPanelConfigs
+  
+  # Extracts the configuration that matches the number of panels in the screening
+  annual_solar_generation <- panels_generation[panels_generation$panelsCount == screening_panel_count, ]
+  panel_count <- screening_panel_count
+  
+  # If the number of panels from the screening doesn't exactly match with the API call, this will find the next closest match
+  if (dim(annual_solar_generation)[1] == 0){
+    panel_count <- panels_generation$panelsCount[which.min(abs(panels_generation$panelsCount - screening_panel_count))]
+    annual_solar_generation <- panels_generation[panels_generation$panelsCount == panel_count, ]
+  }
+  
+  # Maximum site energy consumption based on $500 utility bill
+  annual_energy_consumption <- max(test_data$solarPotential$financialAnalyses$financialDetails$initialAcKwhPerYear, na.rm = TRUE)
+  
+  # Display results
+  cat(
+    'Maximum number of panels: ', max_panels, '\n',
+    'Number of panels in configuration: ', panel_count, '\n',
+    'Total roof area in square feet: ', roof_area_sqft, '\n',
+    'Annual energy consumption (kWh): ', annual_energy_consumption, '\n',
+    'Annual solar generation (kWh): ', annual_solar_generation$yearlyEnergyDcKwh, '\n',
+    'Nameplate capacity (kW): ', (panel_count * 400 / 1000), '\n',
+    'Maximum monthly energy bill: $500', '\n',
+    sep = ''
+    )
+}
+
+```
+
+
+```{r}
+# Call the function
+get_solar_api_results(latitude = 27.32985, longitude = -82.53173, screening_panel_count = 800,
+                      key = api_key)
+
+```
+
+The following was the old method for manually exploring the data. Use to check results above or as needed
+
+```{r}
+# Call the API to get results for a given site
+
+solar_api_test <- GET(paste0('https://solar.googleapis.com/v1/buildingInsights:findClosest?location.latitude=33.30720&location.longitude=-81.03053&requiredQuality=LOW&key=', api_key))
+
+# Convert JSON to tabular format
+test_data <- fromJSON(rawToChar(solar_api_test$content))
+
+```
+
+
+11/26/2024 Running a batch of sites as requested by the team at CE
+
+```{r}
+api_key <- 'REDACTED'
+first_batch <- read.csv('data/solarapi_batch_nov26/Sites_2024_1313894487973521005.csv')
+second_batch <- read.csv('data/solarapi_batch_nov26/Centers_2023_8353317920455565290.csv')
+
+# Function to fetch Solar API data
+fetch_solarapi <- function(lat, lon, key) {
+    # Make API call
+    response <- GET(paste0('https://solar.googleapis.com/v1/buildingInsights:findClosest?location.latitude=', 
+                           lat, '&location.longitude=', lon, '&requiredQuality=LOW&key=', key))
+    # Parse JSON response
+    data <- fromJSON(rawToChar(response$content))
+    if (!is.null(data$solarPotential) && data$solarPotential$maxArrayPanelsCount > 10) {
+      panels_generation <- data$solarPotential$solarPanelConfigs
+      modeled_panel_count <- as.integer(as.numeric(data$solarPotential$maxArrayPanelsCount) * 0.375)
+      panel_count <- panels_generation$panelsCount[which.min(abs(panels_generation$panelsCount - modeled_panel_count))]
+      nameplate_capacity <- panel_count*370/1000
+      annual_solar_generation <- panels_generation[panels_generation$panelsCount == panel_count, ]$yearlyEnergyDcKwh * (370/400) * (0.885)
+
+      return(c(panel_count, nameplate_capacity, annual_solar_generation))
+    } else {
+      return(c(NA, NA, NA))  # Handle Failed entries
+    }
+}
+
+# Apply above function
+first_batch_results <- first_batch %>%
+  rowwise() %>%
+  mutate(solarapi_results = list(fetch_solarapi(y_sites_rooftop_CEC, x_sites_rooftop_CEC, api_key))) %>%
+  mutate(panel_count = solarapi_results[[1]],
+         nameplate_capacity_kw = solarapi_results[[2]],
+         annual_solar_generation_kwh = solarapi_results[[3]]) %>%
+  ungroup() %>%
+  select(-solarapi_results)
+
+
+# Apply above function
+second_batch_results <- second_batch %>%
+  rowwise() %>%
+  mutate(solarapi_results = list(fetch_solarapi(y_centers_rooftop_CEC, x_centers_rooftop_CEC, api_key))) %>%
+  mutate(panel_count = solarapi_results[[1]],
+         nameplate_capacity_kw = solarapi_results[[2]],
+         annual_solar_generation_kwh = solarapi_results[[3]]) %>%
+  ungroup() %>%
+  select(-solarapi_results)
+
+write.csv(first_batch_results, 'data/solarapi_batch_nov26/Sites_2024_1313894487973521005_solarapi.csv')
+write.csv(second_batch_results, 'data/solarapi_batch_nov26/Centers_2023_8353317920455565290_solarapi.csv')
+```
+
+

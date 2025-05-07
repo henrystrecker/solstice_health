@@ -1,0 +1,34 @@
+---
+title: "MUA Data Cleaning"
+author: "Henry Strecker"
+date: "2025-04-07"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(tidyverse)
+library(here)
+library(janitor)
+```
+
+```{r}
+mua_raw <- read_xlsx(here('code/data/raw/DesignatedMUA.xlsx')) %>% 
+  clean_names()
+
+mua_clean <- mua_raw %>%
+  filter(nchar(mua_p_area_code) <= 5, # Remove any entries that aren't at the county level
+         !str_detect(mua_p_service_area_name, str_c(c('service', 'Service', 'SERVICE'), collapse = "|")), # Remove service areas
+         designation_type_code == 'MUA') %>% # Keep only medically underserved AREAS
+  group_by(fips_code) %>%
+  slice(1) %>% # When using this with groupby, it removes any duplicate entries for a county
+  ungroup() %>%
+  select(fips_code) %>%
+  mutate(mua = TRUE) 
+
+# Write output
+write.csv(mua_clean, here('code/data/mua_designation.csv'), row.names = FALSE)
+
+```
+
