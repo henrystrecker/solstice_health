@@ -35,13 +35,7 @@ fqhc_base <- read.csv('data/fqhc_site_august_14_2024.csv') %>%
          FPL_151_200_Percent, FPL_Over_200_Percent, FPL_Unknown, Uninsured, Medicaid, Medicare, PublicIns, PrivateIns, FEMA_NRI_Risk_Score, y, x) %>% 
   rename(site_lat = y, site_lon = x) # Format existing coordinate data
 
-# NEED TO INCLUDE THE NEW ~2500 SITES HERE WITH THE SAME COLUMNS AS ABOVE
-# new_sites <- read.csv(TEMPORARY)
-# 
-# all_sites <- fqhc_base %>%
-#   rbind(new_sites)
-
-all_sites <- fqhc_base # TEMPORARY
+all_sites <- fqhc_base
 ```
 
 
@@ -204,7 +198,7 @@ all_sites <- all_sites %>%
 ```{r, warning=FALSE, message=FALSE}
 
 # Get your own API key here: https://api.census.gov/data/key_signup.html
-census_api_key('f5b1d1d3e085a5f678d6fe7723ece747f9e4b9f5', install = TRUE, overwrite = TRUE)
+census_api_key('REDACTED', install = TRUE, overwrite = TRUE)
 
 # UPDATE this with the location of your data
 data_path <- 'data/raw'
